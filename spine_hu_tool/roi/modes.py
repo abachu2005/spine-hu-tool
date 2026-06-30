@@ -12,7 +12,7 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt, convolve
 
 from ..config import ROIParams
-from ..geometry.coords import make_sphere, ball
+from ..geometry.coords import make_sphere, make_cylinder, ball
 from ..geometry.local_axes import compute_local_axes
 from .distance import (body_distance, make_inner, central_height_mask,
                        anterior_mask, proportional_margin)
@@ -25,6 +25,33 @@ def _clamp_center_to_body(center, body, dist):
     if inside:
         return c
     return tuple(int(v) for v in np.unravel_index(np.argmax(dist), dist.shape))
+
+
+def _mid_body_center(body, spacing, central):
+    """Robust mid-vertebral-body center, used by the centroid and cylinder modes.
+
+    Placement is anatomy-only (HU-independent), so it stays reproducible:
+      - z (SI): the midline slice of the central-height band.
+      - (x, y): the in-plane *incenter* -- the deepest interior point of that
+        mid-axial cross-section (argmax of the in-plane distance transform).
+    Using the incenter instead of the raw body centroid avoids the bias from the
+    posterior basivertebral notch / wedging that pulled the centroid off-center,
+    so the ROI renders centred in the sagittal and coronal views.
+    """
+    sx, sy, sz = spacing
+    zcols = np.where(central.any(axis=(0, 1)))[0]
+    z0 = int(round(float(zcols.mean()))) if zcols.size else body.shape[2] // 2
+    slc = body[:, :, z0]
+    if not slc.any():                       # nudge to the nearest non-empty slice
+        zb = np.where(body.any(axis=(0, 1)))[0]
+        if zb.size:
+            z0 = int(zb[np.argmin(np.abs(zb - z0))])
+            slc = body[:, :, z0]
+    if slc.any():
+        inplane = distance_transform_edt(slc, sampling=(sx, sy))
+        x0, y0 = np.unravel_index(int(np.argmax(inplane)), slc.shape)
+        return (int(x0), int(y0), int(z0))
+    return (body.shape[0] // 2, body.shape[1] // 2, int(z0))
 
 
 def centroid_sphere(body, spacing, params: ROIParams, hu=None):
@@ -100,7 +127,7 @@ def centroid_volume_sphere(body, spacing, params: ROIParams, hu=None):
     axes = compute_local_axes(body, spacing)
     central = central_height_mask(body, axes, spacing, params.central_height_frac)
     dist = body_distance(body, spacing)
-    center = _clamp_center_to_body(tuple(axes.centroid), body & central, dist * central)
+    center = _mid_body_center(body, spacing, central)
 
     voxel_vol = float(spacing[0] * spacing[1] * spacing[2])
     v_body = float(body.sum()) * voxel_vol
@@ -128,6 +155,71 @@ def centroid_volume_sphere(body, spacing, params: ROIParams, hu=None):
         "max_safe_radius_mm": max_safe,
         "margin_mm": max_safe - r,        # 3D clearance from cortex/endplate
         "band_sphere_vox": int(sphere.sum()),
+        "axes": axes,
+        "warnings": warnings,
+    }
+
+
+def cylinder_volume(body, spacing, params: ROIParams, hu=None):
+    """Volume-proportional cylinder anchored at the mid-vertebral-body center.
+
+    A reproducibility-first VOI like the centroid sphere, but shaped as an
+    axial cylinder (circular in-plane, axis along SI). Placement is anatomy-only
+    (HU-independent). The height is a fraction of the body's SI extent, capped to
+    stay within the central, endplate-safe band; the radius is solved from the
+    same volume-proportional target as the sphere and then capped by the in-plane
+    cortical clearance so the whole cylinder stays inside the body. Reported
+    statistic is the median HU (computed downstream).
+    """
+    sx, sy, sz = spacing
+    axes = compute_local_axes(body, spacing)
+    central = central_height_mask(body, axes, spacing, params.central_height_frac)
+    dist = body_distance(body, spacing)
+    center = _mid_body_center(body, spacing, central)
+    cx, cy, cz = center
+
+    # endplate-safe half-height: stay within the central band on BOTH sides
+    zcols = np.where(central.any(axis=(0, 1)))[0]
+    if zcols.size:
+        half_h_band = float(min(cz - zcols.min(), zcols.max() - cz)) * sz
+    else:
+        half_h_band = sz
+    zb = np.where(body.any(axis=(0, 1)))[0]
+    body_h_mm = float(zb.max() - zb.min() + 1) * sz if zb.size else sz
+    half_h = max(min(params.cylinder_height_frac * body_h_mm / 2.0, half_h_band), 0.0)
+    full_h = max(2.0 * half_h, sz)
+
+    # in-plane cortical clearance at the center slice (independent of slice thickness)
+    slc = body[:, :, cz]
+    if slc.any():
+        inplane = distance_transform_edt(slc, sampling=(sx, sy))
+        max_safe = float(inplane[cx, cy])
+    else:
+        max_safe = 0.0
+    margin = proportional_margin(max_safe, params.margin_floor_mm, params.margin_frac)
+    r_cap = max(max_safe - margin, 0.0)
+
+    voxel_vol = float(sx * sy * sz)
+    v_target = params.roi_volume_frac * float(body.sum()) * voxel_vol
+    r_vol = (v_target / (np.pi * full_h)) ** 0.5 if full_h > 0 else 0.0
+    r = float(max(min(r_vol, r_cap), 0.0))
+
+    warnings = []
+    if r < params.min_radius_mm:
+        warnings.append(f"endplate-safe radius {r:.1f}mm below floor "
+                        f"{params.min_radius_mm}mm")
+
+    cyl = make_cylinder(body.shape, center, r, half_h, spacing)
+    roi = cyl & body
+    return {
+        "mode": "cylinder_volume",
+        "roi_mask": roi,
+        "center_idx": center,
+        "radius_mm": r,
+        "max_safe_radius_mm": max_safe,
+        "margin_mm": max_safe - r,
+        "height_mm": full_h,
+        "band_sphere_vox": int(cyl.sum()),
         "axes": axes,
         "warnings": warnings,
     }
@@ -285,6 +377,7 @@ def axial_ellipse_2d(body, spacing, params: ROIParams, hu=None):
 
 ROI_MODES = {
     "centroid_volume_sphere": centroid_volume_sphere,
+    "cylinder_volume": cylinder_volume,
     "lowest_attenuation_sphere": lowest_attenuation_sphere,
     "centroid_sphere": centroid_sphere,
     "largest_safe_sphere": largest_safe_sphere,
@@ -294,6 +387,16 @@ ROI_MODES = {
 
 # Reproducible-by-design default: centroid placement + volume-proportional size.
 DEFAULT_MODE = "centroid_volume_sphere"
+
+# The only ROI modes surfaced to physicians (UI dropdown + CLI). Friendly label
+# -> internal mode key. The remaining ROI_MODES entries stay available in code
+# for the internal reproducibility / variance comparison study.
+EXPOSED_MODES = {
+    "centroid": "centroid_volume_sphere",
+    "cylinder": "cylinder_volume",
+    "westerhoff": "lowest_attenuation_sphere",
+}
+MODE_LABELS = {v: k for k, v in EXPOSED_MODES.items()}
 
 # ROI methods compared head-to-head for the reproducibility / variance study:
 # our default centroid + volume-proportional 3D, Westerhoff's lowest-attenuation

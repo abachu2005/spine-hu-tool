@@ -25,6 +25,10 @@ MARGIN_FRAC = 0.20
 # anterior to the basivertebral foramen.
 ROI_VOLUME_FRAC = 0.05           # sphere volume as a fraction of body volume
 ANTERIOR_FRAC = 0.60             # keep the anterior 60% of AP extent as candidates
+# Cylinder ROI: axis along SI, height = fraction of body SI extent (capped to
+# stay inside the central, endplate-safe band); radius solved from the same
+# volume-proportional target as the sphere, capped by in-plane cortical clearance.
+CYLINDER_HEIGHT_FRAC = 0.50      # cylinder height as a fraction of body height
 
 # --- Segmentation consistency gate --------------------------------------------
 # Sanity bounds on each vertebra label (full mask: body + posterior elements).
@@ -77,6 +81,7 @@ class ROIParams:
     margin_frac: float = MARGIN_FRAC
     roi_volume_frac: float = ROI_VOLUME_FRAC
     anterior_frac: float = ANTERIOR_FRAC
+    cylinder_height_frac: float = CYLINDER_HEIGHT_FRAC
 
     def to_dict(self) -> dict:
         return asdict(self)

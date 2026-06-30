@@ -81,6 +81,7 @@ def analyze_dataset(folder: str, series: Optional[SeriesInfo] = None,
                     fast: Optional[bool] = None, reviewer: str = "unknown",
                     params: Optional[ROIParams] = None,
                     seg_url: Optional[str] = None, api_key: Optional[str] = None,
+                    local: bool = False,
                     compute_comparison: bool = False,
                     apply_calibration: bool = True,
                     progress: ProgressCb = None) -> ReviewState:
@@ -91,7 +92,7 @@ def analyze_dataset(folder: str, series: Optional[SeriesInfo] = None,
     # Resolution policy: full-res (1.5 mm) gives the best ROI placement but
     # needs ~12 GB RAM, so default to it only when segmentation is offloaded to
     # the cloud; run laptop-local segmentation in fast (3 mm) mode by default.
-    remote = resolve_seg_url(seg_url) is not None
+    remote = (not local) and resolve_seg_url(seg_url) is not None
     if fast is None:
         fast = not remote
 
@@ -129,7 +130,7 @@ def analyze_dataset(folder: str, series: Optional[SeriesInfo] = None,
     else:
         report("Segmenting vertebrae (first run also downloads the model; "
                "this can take a few minutes)...", -1.0)
-    seg = segment(volume, cache, name, fast=fast,
+    seg = segment(volume, cache, name, fast=fast, local=local,
                   seg_url=seg_url, api_key=api_key,
                   progress=lambda m, _f: report(m, -1.0))
 

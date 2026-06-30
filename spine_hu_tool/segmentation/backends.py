@@ -70,15 +70,19 @@ def resolve_api_key(api_key: Optional[str]) -> Optional[str]:
 
 
 def segment(volume: Volume, work_dir: str, name: str, *,
-            fast: bool = True, force: bool = False,
+            fast: bool = True, force: bool = False, local: bool = False,
             seg_url: Optional[str] = None, api_key: Optional[str] = None,
             timeout: float = 1200.0, progress: ProgressCb = None):
     """Return the multilabel segmentation array, running locally or remotely.
 
     Remote and local share the same on-disk cache (`{name}_seg.nii.gz` in
     `work_dir`), so switching backends never forces a re-run of cached cases.
+
+    `local=True` forces on-machine segmentation regardless of any configured
+    server URL (env / baked-in default). Otherwise the remote endpoint is
+    resolved and used; only when no URL resolves does it fall back to local.
     """
-    url = resolve_seg_url(seg_url)
+    url = None if local else resolve_seg_url(seg_url)
     if url is None:
         return run_segmentation(volume, work_dir, name, fast=fast, force=force)
     return _segment_remote(volume, work_dir, name, url, api_key,

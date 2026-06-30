@@ -13,7 +13,7 @@ from ..config import ROIParams
 from ..io.dicom_loader import load_volume_from_nifti
 from ..pipeline import process_case
 from ..export.writers import export_case
-from ..roi.modes import ROI_MODES, DEFAULT_MODE
+from ..roi.modes import EXPOSED_MODES, DEFAULT_MODE
 
 
 def _print_summary(case):
@@ -146,7 +146,7 @@ def build_parser():
     m.add_argument("--level", action="append", help="level e.g. L1 (repeatable); default = all clean")
     m.add_argument("--all-clean", action="store_true", help="measure all clean levels (default)")
     m.add_argument("--roi-mode", default=DEFAULT_MODE,
-                   choices=list(ROI_MODES))
+                   choices=list(EXPOSED_MODES.values()))
     m.add_argument("--compare", action="store_true",
                    help="also measure every ROI method per level (reproducibility study)")
     m.add_argument("--no-calibration", action="store_true",
@@ -173,7 +173,7 @@ def build_parser():
     vsrc.add_argument("--seg", help="NIfTI TotalSegmentator labels (with --volume)")
     val.add_argument("--level", action="append", help="level e.g. L1 (repeatable)")
     val.add_argument("--roi-mode", default=DEFAULT_MODE,
-                     choices=list(ROI_MODES))
+                     choices=list(EXPOSED_MODES.values()))
     val.add_argument("--no-calibration", action="store_true")
     val.add_argument("--out", required=True, help="output folder")
     val.add_argument("--fast", action="store_true")
