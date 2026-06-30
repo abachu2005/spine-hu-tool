@@ -119,30 +119,61 @@ def _segment_remote(volume: Volume, work_dir: str, name: str, url: str,
         if progress:
             progress(msg, -1.0)
 
+    import random
+
+    def _with_retry(label, fn, attempts=4):
+        """Run an HTTP step, retrying transient (5xx / network) failures.
+
+        Cloud Run and GCS occasionally return 5xx (e.g. a 504 InternalError on
+        a signed-URL PUT); these are explicitly "please try again" and succeed
+        on retry. 4xx are caller errors and fail fast.
+        """
+        last_err = None
+        for i in range(attempts):
+            try:
+                resp = fn()
+            except requests.RequestException as exc:
+                last_err = RuntimeError(f"{label} failed (network): {exc}")
+            else:
+                if resp.status_code in (200, 201):
+                    return resp
+                if resp.status_code < 500:
+                    raise RuntimeError(
+                        f"{label} failed ({resp.status_code}): {resp.text[:300]}")
+                last_err = RuntimeError(
+                    f"{label} failed ({resp.status_code}): {resp.text[:200]}")
+            if i < attempts - 1:
+                wait = min(2 ** i, 8) + random.random()
+                _report(f"{label}: transient cloud error, retrying in {wait:.0f}s...")
+                time.sleep(wait)
+        raise last_err or RuntimeError(f"{label} failed")
+
     # 1. mint a signed upload URL
     _report("Requesting upload URL...")
-    r = requests.post(f"{url}/upload-url", headers=headers, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"upload-url failed ({r.status_code}): {r.text[:300]}")
+    r = _with_retry("upload-url",
+                    lambda: requests.post(f"{url}/upload-url",
+                                          headers=headers, timeout=60))
     up = r.json()
 
-    # 2. upload the volume directly to GCS via the signed URL
+    # 2. upload the volume directly to GCS via the signed URL. Reopen the file
+    # on each attempt so a retry re-streams from the start.
     _report("Uploading scan to cloud storage...")
-    with open(in_path, "rb") as fh:
-        pr = requests.put(up["url"], data=fh,
-                          headers={"Content-Type": up["content_type"]},
-                          timeout=600)
-    if pr.status_code not in (200, 201):
-        raise RuntimeError(f"GCS upload failed ({pr.status_code}): {pr.text[:300]}")
+
+    def _put_volume():
+        with open(in_path, "rb") as fh:
+            return requests.put(up["url"], data=fh,
+                                headers={"Content-Type": up["content_type"]},
+                                timeout=600)
+
+    _with_retry("GCS upload", _put_volume)
 
     # 3. start segmentation; the server returns a job id immediately
     _report("Starting segmentation on the cloud service...")
-    sr = requests.post(f"{url}/segment-async", headers=headers,
-                       json={"object_name": up["object_name"], "fast": fast},
-                       timeout=60)
-    if sr.status_code != 200:
-        raise RuntimeError(
-            f"Could not start segmentation ({sr.status_code}): {sr.text[:500]}")
+    sr = _with_retry("start segmentation",
+                     lambda: requests.post(
+                         f"{url}/segment-async", headers=headers,
+                         json={"object_name": up["object_name"], "fast": fast},
+                         timeout=60))
     job_id = sr.json()["job_id"]
 
     # 4. poll until the job finishes (short requests -> no hung connections)
