@@ -27,6 +27,15 @@ ProgressCb = Optional[Callable[[str, float], None]]
 # and key are resolved from (1) the explicit argument, (2) env vars, (3) the
 # local deploy credentials file, (4) the baked-in deployed service URL.
 DEFAULT_SEG_URL = "https://spine-hu-seg-980966741284.us-central1.run.app"
+
+# Shared pilot key baked into the client so downloaded installers authenticate
+# out of the box (the server is gated only to keep random internet traffic from
+# running up cost). This is intentionally a low-value, rotatable shared secret
+# for a private pilot -- NOT per-user auth. Rotate by updating the Cloud Run
+# SPINE_HU_API_KEY env var and this constant. Override with the SPINE_HU_API_KEY
+# env var or work/cloud_run_credentials.txt during development.
+DEFAULT_API_KEY = "REMOVED_CLOUD_API_KEY"
+
 _CREDS_FILE = os.path.join(os.path.dirname(__file__), "..", "..",
                            "work", "cloud_run_credentials.txt")
 
@@ -57,7 +66,7 @@ def resolve_seg_url(seg_url: Optional[str]) -> Optional[str]:
 
 def resolve_api_key(api_key: Optional[str]) -> Optional[str]:
     return (api_key or os.environ.get("SPINE_HU_API_KEY")
-            or _from_creds_file("SPINE_HU_API_KEY"))
+            or _from_creds_file("SPINE_HU_API_KEY") or DEFAULT_API_KEY)
 
 
 def segment(volume: Volume, work_dir: str, name: str, *,
