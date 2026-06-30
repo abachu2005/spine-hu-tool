@@ -16,7 +16,7 @@ from .roi.modes import place_roi, COMPARISON_MODES
 from .roi.distance import make_inner, proportional_margin, body_distance
 from .measurement.hu_stats import compute_hu_stats
 from .measurement.qc import compute_qc
-from .measurement.level_qc import tag_levels, clean_levels
+from .measurement.level_qc import tag_levels
 from .measurement.calibration import compute_calibration, reference_context
 from .segmentation.totalseg_runner import label_id_for, vertebra_labels
 from .segmentation.consistency import check_segmentation
@@ -158,11 +158,14 @@ def process_case(volume: Volume, seg: np.ndarray,
     tags = tag_levels(volume.hu, seg, volume.spacing)
     tag_by_level = {t["level"]: t for t in tags}
 
-    if levels is None:
-        if only_clean:
-            levels = clean_levels(tags)
-        else:
-            levels = [lvl for _id, lvl in vertebra_labels(seg)]
+    # When no explicit level list is given we ALWAYS walk every vertebra present
+    # in the scan so the review list is complete. Instrumented (metal) levels are
+    # shown as excluded entries rather than silently dropped -- otherwise a level
+    # with a screw simply vanishes from the app, which is confusing and hides the
+    # hardware from the physician.
+    explicit_levels = levels is not None
+    if not explicit_levels:
+        levels = [lvl for _id, lvl in vertebra_labels(seg)]
 
     seg_levels = seg_check.get("levels", {})
     results: dict[str, ROIResult] = {}
@@ -170,16 +173,30 @@ def process_case(volume: Volume, seg: np.ndarray,
     for i, lvl in enumerate(levels):
         if progress:
             progress(f"Measuring {lvl} ({i + 1}/{n})...", (i + 1) / n)
+        status = tag_by_level.get(lvl, {}).get("status")
         sv = seg_levels.get(lvl)
         if sv is not None and not sv["valid"]:
             res = _excluded_result(
                 lvl, mode, ["segmentation invalid: " + r for r in sv["reasons"]],
                 full_vox=sv.get("voxels", 0))
+        elif (not explicit_levels) and status == "excluded":
+            # metal hardware inside the vertebra: never measure HU through metal,
+            # but keep the level visible (red / excluded) so the screws show up.
+            res = _excluded_result(
+                lvl, mode, ["instrumented level: metal hardware in vertebra"],
+                full_vox=tag_by_level.get(lvl, {}).get("voxels", 0))
         else:
             res = measure_level(volume, seg, lvl, params, mode,
                                 compute_comparison=compute_comparison)
+            # near / adjacent to instrumented hardware: streak/bloom can bias the
+            # number, so surface it but flag for review instead of passing clean.
+            if (res is not None and only_clean and status == "review"
+                    and res.qc.get("qc_status") in ("pass", None)):
+                res.qc["qc_status"] = "review"
+                res.qc.setdefault("warnings", []).append(
+                    "review: near an instrumented level (streak/bloom risk)")
         if res is not None:
-            res.qc.setdefault("level_status", tag_by_level.get(lvl, {}).get("status"))
+            res.qc.setdefault("level_status", status)
             results[lvl] = res
 
     # --- HU calibration (no diagnostic classification; see _annotate_calibration)

@@ -1,0 +1,35 @@
+---
+title: Spine HU Tool - How It Works
+---
+flowchart TD
+    start([Physician opens the app]) --> openFolder["Open a DICOM folder<br/>(a CT study)"]
+    openFolder --> pickSeries["Auto-pick the real axial CT series<br/>(scouts / reformats rejected)"]
+    pickSeries --> cacheCheck{"Already segmented<br/>this scan before?"}
+
+    cacheCheck -->|"Yes (cached)"| loadMasks["Load saved vertebra masks<br/>(instant)"]
+    cacheCheck -->|No| cloud
+
+    subgraph cloud ["Vertebra segmentation (the only ML step)"]
+        upload["Upload scan to the cloud service"] --> seg["TotalSegmentator labels<br/>each vertebra"]
+        seg --> back["Download labeled masks"]
+    end
+    back --> gate
+
+    loadMasks --> gate{"Segmentation<br/>quality gate"}
+    gate -->|"Looks wrong"| flagSeg["Flag scan for review"]
+    gate -->|OK| perLevel
+
+    subgraph perLevel ["For each vertebra (deterministic math)"]
+        meta["Skip levels with metal<br/>hardware + neighbors"] --> isolate["Isolate the vertebral body<br/>from the bony arch"]
+        isolate --> axes["Build a tilt-aware<br/>local frame (LR / AP / SI)"]
+        axes --> roi["Place a centroid sphere<br/>in central spongy bone,<br/>clear of the hard shell"]
+        roi --> hu["Measure HU + run<br/>QC checks"]
+    end
+    hu --> verdict{"QC verdict"}
+    verdict --> review
+
+    review["Tri-planar greyscale review<br/>green = pass, amber = review, red = excluded"] --> adjust["Physician can nudge the sphere,<br/>resize it, accept / reject (Enter),<br/>undo (Cmd+Z)"]
+    adjust --> export["Export CSV / JSON, overlays,<br/>masks + full audit trail"]
+    export --> done([Done])
+
+    flagSeg --> review
