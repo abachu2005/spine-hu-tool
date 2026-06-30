@@ -38,3 +38,30 @@ def test_modes_available():
     for mode in ("centroid_sphere", "largest_safe_sphere", "trabecular_core"):
         info = place_roi(body_true, (1.0, 1.0, 1.0), ROIParams(), mode)
         assert info["roi_mask"].sum() > 0
+
+
+def test_cylinder_volume_trabecular_and_contained():
+    full, body_true, hu = make_vertebra_phantom()
+    sp = (1.0, 1.0, 1.0)
+    info = place_roi(body_true, sp, ROIParams(), "cylinder_volume")
+    roi = info["roi_mask"]
+    assert roi.sum() > 0
+    # the whole cylinder stays inside the body (cortex/endplate clearance)
+    assert int((roi & ~body_true).sum()) == 0
+    stats = compute_hu_stats(hu, roi, sp)
+    assert 120 < stats["mean_HU"] < 220        # trabecular bone, not cortex
+    assert info["radius_mm"] > 0
+    assert info["height_mm"] > 0
+
+
+def test_centroid_center_is_concentric_with_cross_section():
+    """The mid-body center must sit at the cross-section center so the ROI
+    renders concentric in the sagittal/coronal views (centering fix)."""
+    full, body_true, hu = make_vertebra_phantom()
+    sp = (1.0, 1.0, 1.0)
+    info = place_roi(body_true, sp, ROIParams(), "centroid_volume_sphere")
+    cx, cy, cz = info["center_idx"]
+    coords = np.argwhere(body_true[:, :, cz])      # (x, y) of the mid-axial slice
+    mean_x, mean_y = coords.mean(axis=0)
+    assert abs(mean_x - cx) <= 3
+    assert abs(mean_y - cy) <= 3

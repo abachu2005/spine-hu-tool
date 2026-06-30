@@ -16,8 +16,9 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .review_state import ReviewState
 from .analysis import analyze_dataset
-from ..roi.modes import ROI_MODES, DEFAULT_MODE
+from ..roi.modes import DEFAULT_MODE, EXPOSED_MODES, MODE_LABELS
 from ..segmentation.backends import resolve_seg_url
+from ..segmentation.totalseg_runner import local_seg_available
 
 pg.setConfigOption("imageAxisOrder", "row-major")
 pg.setConfigOption("background", "#1a1a1d")
@@ -140,18 +141,36 @@ class AnalyzeWorker(QtCore.QThread):
     finished_state = QtCore.Signal(object)
     failed = QtCore.Signal(str)
 
-    def __init__(self, folder, series, mode, reviewer, seg_url=None, api_key=None):
+    def __init__(self, folder, series, mode, reviewer, seg_url=None, api_key=None,
+                 local=False):
         super().__init__()
         self.folder, self.series, self.mode, self.reviewer = folder, series, mode, reviewer
-        self.seg_url, self.api_key = seg_url, api_key
+        self.seg_url, self.api_key, self.local = seg_url, api_key, local
 
     def run(self):
         try:
             st = analyze_dataset(self.folder, series=self.series, mode=self.mode,
                                  only_clean=True, reviewer=self.reviewer,
                                  seg_url=self.seg_url, api_key=self.api_key,
+                                 local=self.local,
                                  progress=lambda m, f: self.progress.emit(m, f))
             self.finished_state.emit(st)
+        except Exception as e:  # surfaced to the user
+            self.failed.emit(str(e))
+
+
+class SetupWorker(QtCore.QThread):
+    """Installs the local-segmentation runtime (torch + TotalSegmentator +
+    weights) off the UI thread, streaming progress lines."""
+    progress = QtCore.Signal(str)
+    done = QtCore.Signal()
+    failed = QtCore.Signal(str)
+
+    def run(self):
+        try:
+            from ..segmentation.local_setup import setup_local_seg
+            setup_local_seg(progress=lambda m: self.progress.emit(m))
+            self.done.emit()
         except Exception as e:  # surfaced to the user
             self.failed.emit(str(e))
 
@@ -233,12 +252,26 @@ class MainWindow(QtWidgets.QMainWindow):
         # step never touches this machine unless the field is explicitly cleared.
         self.seg_url_edit = QtWidgets.QLineEdit(resolve_seg_url(None) or "")
         self.seg_url_edit.setFixedWidth(420)
-        self.seg_url_edit.setPlaceholderText(
-            "Segmentation server URL (cloud default; clear to run locally)")
+        self.seg_url_edit.setPlaceholderText("Segmentation server URL (cloud default)")
+        # Local segmentation toggle: when checked, the heavy TotalSegmentator step
+        # runs on this machine instead of the cloud service (requires the optional
+        # local-seg dependencies / TotalSegmentator to be installed).
+        self.local_seg_cb = QtWidgets.QCheckBox(
+            "Run segmentation on this computer (no upload)")
+        self.local_seg_cb.setToolTip(
+            "Process the scan locally with TotalSegmentator instead of the cloud "
+            "service. Needs more RAM/CPU; set it up once with the button below.")
+        self.local_seg_cb.toggled.connect(self._on_local_toggled)
+        # One-time installer for the local ML runtime (torch + TotalSegmentator
+        # + weights) into a user-managed environment outside the app bundle.
+        self.setup_local_btn = QtWidgets.QPushButton("Set up local segmentation...")
+        self.setup_local_btn.setFixedWidth(420)
+        self.setup_local_btn.clicked.connect(self.setup_local_seg)
+        self._refresh_local_seg_state()
         self.roi_mode_combo = QtWidgets.QComboBox(); self.roi_mode_combo.setFixedWidth(420)
-        for m in ROI_MODES:
-            self.roi_mode_combo.addItem(m)
-        self.roi_mode_combo.setCurrentText(DEFAULT_MODE)
+        for label, key in EXPOSED_MODES.items():
+            self.roi_mode_combo.addItem(label, key)
+        self.roi_mode_combo.setCurrentText(MODE_LABELS.get(DEFAULT_MODE, "centroid"))
         self.series_combo = QtWidgets.QComboBox(); self.series_combo.setFixedWidth(420)
         self.series_combo.setVisible(False)
         self.analyze_btn = QtWidgets.QPushButton("Analyze")
@@ -247,9 +280,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress = QtWidgets.QProgressBar(); self.progress.setFixedWidth(420)
         self.progress.setVisible(False)
         self.status_lbl = QtWidgets.QLabel(""); self.status_lbl.setAlignment(QtCore.Qt.AlignCenter)
-        for widget in (title, sub, btn, self.seg_url_edit, self.roi_mode_combo,
-                       self.series_combo, self.analyze_btn, self.progress,
-                       self.status_lbl):
+        for widget in (title, sub, btn, self.seg_url_edit, self.local_seg_cb,
+                       self.setup_local_btn, self.roi_mode_combo, self.series_combo,
+                       self.analyze_btn, self.progress, self.status_lbl):
             v.addWidget(widget, alignment=QtCore.Qt.AlignHCenter)
         v.addStretch()
         return w
@@ -376,6 +409,53 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_lbl.setText("No DICOM CT series found in this folder.")
         return best
 
+    def _on_local_toggled(self, checked):
+        # The server URL is irrelevant when segmenting locally; grey it out so the
+        # choice is unambiguous.
+        self.seg_url_edit.setEnabled(not checked)
+
+    def _refresh_local_seg_state(self):
+        """Reflect whether local segmentation is installed: enable the checkbox
+        if so, otherwise offer the one-time setup button."""
+        avail = local_seg_available()
+        self.local_seg_cb.setEnabled(avail)
+        if not avail and self.local_seg_cb.isChecked():
+            self.local_seg_cb.setChecked(False)
+        self.setup_local_btn.setVisible(not avail)
+
+    def setup_local_seg(self):
+        """Kick off the one-time local-segmentation install in a worker thread."""
+        if QtWidgets.QMessageBox.question(
+                self, "Set up local segmentation",
+                "This downloads everything needed to segment on this computer -- "
+                "a private Python, PyTorch + TotalSegmentator, and the model "
+                "(about 1-3 GB total). Nothing needs to be preinstalled. It runs "
+                "once and needs an internet connection. Continue?") \
+                != QtWidgets.QMessageBox.Yes:
+            return
+        self.setup_local_btn.setEnabled(False)
+        self.progress.setVisible(True); self.progress.setRange(0, 0)
+        self.status_lbl.setText("Setting up local segmentation...")
+        self.setup_worker = SetupWorker()
+        self.setup_worker.progress.connect(
+            lambda m: self.status_lbl.setText(m))
+        self.setup_worker.done.connect(self._on_setup_done)
+        self.setup_worker.failed.connect(self._on_setup_failed)
+        self.setup_worker.start()
+
+    def _on_setup_done(self):
+        self.progress.setVisible(False); self.progress.setRange(0, 100)
+        self.setup_local_btn.setEnabled(True)
+        self.status_lbl.setText("Local segmentation installed.")
+        self._refresh_local_seg_state()
+        self.local_seg_cb.setChecked(True)
+
+    def _on_setup_failed(self, msg):
+        self.progress.setVisible(False); self.progress.setRange(0, 100)
+        self.setup_local_btn.setEnabled(True)
+        self.status_lbl.setText("Local setup failed.")
+        QtWidgets.QMessageBox.critical(self, "Local setup failed", msg)
+
     def start_analyze(self):
         series = getattr(self, "_row_series", {}).get(self.series_combo.currentIndex())
         if series is None:        # header/empty selection -> first available series
@@ -385,10 +465,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.series = series
         self.progress.setVisible(True); self.analyze_btn.setEnabled(False)
+        local = self.local_seg_cb.isChecked()
         seg_url = self.seg_url_edit.text().strip() or None
-        mode = self.roi_mode_combo.currentText() or DEFAULT_MODE
+        mode = self.roi_mode_combo.currentData() or DEFAULT_MODE
         self.worker = AnalyzeWorker(self.folder, self.series, mode,
-                                    "physician", seg_url=seg_url)
+                                    "physician", seg_url=seg_url, local=local)
         self.worker.progress.connect(self._on_progress)
         self.worker.finished_state.connect(self._on_analyzed)
         self.worker.failed.connect(self._on_failed)
@@ -668,7 +749,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.radius_val.setText(f"{r.radius_mm:.1f}")
         if r.qc.get("qc_status") == "excluded":
             self.hu_label.setText(
-                f"<b>{r.level}</b> ({r.mode})<br>"
+                f"<b>{r.level}</b> ({MODE_LABELS.get(r.mode, r.mode)})<br>"
                 f"<b style='color:#c5544a'>EXCLUDED</b> - no HU reported<br>"
                 f"reason: {r.qc.get('exclusion_reason', '')}<br>{warns}")
             return
@@ -678,7 +759,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ctx = s.get("hu_context")
         ctx_line = f"<span style='color:#8a8a92'>{ctx}</span><br>" if ctx else ""
         self.hu_label.setText(
-            f"<b>{r.level}</b> ({r.mode})<br>"
+            f"<b>{r.level}</b> ({MODE_LABELS.get(r.mode, r.mode)})<br>"
             f"median {s.get('median_HU', float('nan')):.0f} | mean {s.get('mean_HU', float('nan')):.0f} HU<br>"
             f"{cal_line}"
             f"SD {s.get('sd_HU', float('nan')):.0f} | p05-p95 {s.get('p05_HU', float('nan')):.0f}-{s.get('p95_HU', float('nan')):.0f}<br>"

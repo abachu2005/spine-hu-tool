@@ -82,7 +82,17 @@ def _ts_binary() -> Optional[str]:
     cand = os.path.join(os.path.dirname(sys.executable), "TotalSegmentator")
     if os.path.exists(cand):
         return cand
-    return shutil.which("TotalSegmentator")
+    on_path = shutil.which("TotalSegmentator")
+    if on_path:
+        return on_path
+    # The app-managed local-seg environment, installed on demand by the user.
+    from .local_setup import managed_ts_binary
+    return managed_ts_binary()
+
+
+def local_seg_available() -> bool:
+    """True if TotalSegmentator is installed so segmentation can run locally."""
+    return _ts_binary() is not None
 
 
 def run_segmentation(volume: Volume, work_dir: str, name: str,

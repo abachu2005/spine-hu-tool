@@ -69,6 +69,23 @@ def make_sphere(shape, center_idx, radius_mm: float, spacing) -> np.ndarray:
     return d2 <= radius_mm ** 2
 
 
+def make_cylinder(shape, center_idx, radius_mm: float, half_height_mm: float,
+                  spacing) -> np.ndarray:
+    """Boolean cylinder centered at a voxel index.
+
+    The circular cross-section lies in the in-plane (x, y) axes and the axis
+    runs along z (the through-slice / SI direction), so it renders as a circle
+    in the axial view and a rectangle in the sagittal/coronal views.
+    """
+    sx, sy, sz = spacing
+    cx, cy, cz = center_idx
+    X, Y, Z = np.meshgrid(np.arange(shape[0]), np.arange(shape[1]),
+                          np.arange(shape[2]), indexing="ij")
+    in_plane = ((X - cx) * sx) ** 2 + ((Y - cy) * sy) ** 2 <= radius_mm ** 2
+    in_height = np.abs(Z - cz) * sz <= half_height_mm
+    return in_plane & in_height
+
+
 def crop_bbox(mask: np.ndarray, spacing, pad_mm: float = 20.0):
     """Return a tuple of slices bounding `mask` padded by pad_mm (clamped)."""
     idx = np.argwhere(mask)
