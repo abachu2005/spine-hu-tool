@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>Spine HU Tool - Download</title>
+  <style>
+    :root {
+      --bg: #1a1a1d; --panel: #242428; --line: #34343a;
+      --fg: #d8d8d8; --muted: #9a9aa2; --accent: #6aa0dc;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--fg);
+      font: 15px/1.55 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      display: flex; justify-content: center; padding: 40px 16px;
+    }
+    .wrap { width: 100%; max-width: 760px; }
+    header { display: flex; align-items: center; gap: 16px; margin-bottom: 8px; }
+    header img { width: 56px; height: 56px; border-radius: 12px; }
+    h1 { font-size: 24px; margin: 0; font-weight: 600; }
+    .sub { color: var(--muted); margin: 0 0 28px; }
+    .card {
+      background: var(--panel); border: 1px solid var(--line);
+      border-radius: 12px; padding: 20px 22px; margin-bottom: 16px;
+    }
+    .os { display: flex; align-items: center; justify-content: space-between;
+          gap: 16px; flex-wrap: wrap; }
+    .os h2 { font-size: 17px; margin: 0 0 4px; font-weight: 600; }
+    .os p { margin: 0; color: var(--muted); font-size: 13px; }
+    a.dl {
+      display: inline-block; background: var(--accent); color: #0c0c0e;
+      text-decoration: none; font-weight: 600; padding: 10px 18px;
+      border-radius: 8px; white-space: nowrap;
+    }
+    a.dl:hover { filter: brightness(1.08); }
+    details { margin-top: 10px; }
+    summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+    details p, details code { font-size: 13px; color: var(--muted); }
+    code { background: #0e0e10; padding: 2px 6px; border-radius: 5px;
+           color: var(--fg); }
+    .disclaimer {
+      border-left: 3px solid #c9a227; background: #2a2718;
+      padding: 14px 16px; border-radius: 6px; color: #e7e2c8; font-size: 13px;
+    }
+    footer { color: var(--muted); font-size: 12px; margin-top: 24px;
+             text-align: center; }
+    .ver { color: var(--muted); font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <img src="icon.png" alt="" onerror="this.style.display='none'" />
+      <div>
+        <h1>Spine HU Tool</h1>
+        <p class="sub">Reproducible trabecular vertebral-HU measurement from CT.
+          <span class="ver" id="ver"></span></p>
+      </div>
+    </header>
+
+    <div class="disclaimer">
+      <strong>Pilot / research use only.</strong> This is not a validated
+      diagnostic device. Segmentation runs on a shared, unauthenticated cloud
+      service: scans you open are uploaded to it for processing. Use
+      de-identified data only - do not upload PHI.
+    </div>
+
+    <div style="height:18px"></div>
+
+    <div class="card">
+      <div class="os">
+        <div>
+          <h2>macOS</h2>
+          <p>Apple Silicon / Intel - open the .dmg, drag to Applications.</p>
+        </div>
+        <a class="dl" href="latest/SpineHUTool-macos.dmg">Download .dmg</a>
+      </div>
+      <details>
+        <summary>App won't open ("unidentified developer")?</summary>
+        <p>Right-click the app in Applications, choose <strong>Open</strong>,
+          then <strong>Open</strong> again. Or run:
+          <br /><code>xattr -dr com.apple.quarantine "/Applications/Spine HU Tool.app"</code>
+        </p>
+      </details>
+    </div>
+
+    <div class="card">
+      <div class="os">
+        <div>
+          <h2>Windows</h2>
+          <p>64-bit - run the setup wizard (Start Menu shortcut + uninstaller).</p>
+        </div>
+        <a class="dl" href="latest/SpineHUTool-windows-setup.exe">Download setup .exe</a>
+      </div>
+      <details>
+        <summary>SmartScreen warning?</summary>
+        <p>Click <strong>More info</strong>, then <strong>Run anyway</strong>.</p>
+      </details>
+    </div>
+
+    <div class="card">
+      <div class="os">
+        <div>
+          <h2>Linux</h2>
+          <p>x86_64 AppImage - no install needed.</p>
+        </div>
+        <a class="dl" href="latest/SpineHUTool-linux-x86_64.AppImage">Download AppImage</a>
+      </div>
+      <details>
+        <summary>How to run an AppImage</summary>
+        <p><code>chmod +x SpineHUTool-linux-x86_64.AppImage</code> then
+          double-click or run it from a terminal.</p>
+      </details>
+    </div>
+
+    <footer>
+      Spine HU Tool - pilot distribution. Built from a private repository.
+    </footer>
+  </div>
+
+  <script>
+    fetch('version.json', { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (d && d.version) {
+          document.getElementById('ver').textContent = 'v' + d.version;
+        }
+      })
+      .catch(function () {});
+  </script>
+</body>
+</html>

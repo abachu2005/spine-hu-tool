@@ -36,13 +36,31 @@ anatomically standardized and reproducible: on the project test data the L1 gap
 dropped to **~7 HU**, and fully-imaged overlapping levels agree within
 **~14–19 HU** (kernel/resolution noise). See `validation/REPORT.md`.
 
-## Install
+## Install (pilot — physicians / labmates)
+
+Download a ready-to-run installer (no Python needed). Segmentation runs on the
+hosted cloud service, so the app is small.
+
+**Download page:** https://storage.googleapis.com/spine-hu-tool-downloads/index.html
+
+- **macOS**: open the `.dmg`, drag the app to Applications. First launch:
+  right-click → **Open** (unsigned-app workaround).
+- **Windows**: run the setup wizard. On SmartScreen: **More info → Run anyway**.
+- **Linux**: `chmod +x` the AppImage and run it.
+
+> Pilot / research use only — not a validated diagnostic device. Scans are
+> uploaded to a shared, unauthenticated cloud service; use de-identified data
+> only (no PHI).
+
+## Install (developers)
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 # or, as a package (provides the spine-hu / spine-hu-gui commands):
 pip install -e .
+# optional: run TotalSegmentator locally instead of the cloud
+pip install -e ".[local-seg]"
 ```
 
 ## Usage
