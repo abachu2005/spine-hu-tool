@@ -29,7 +29,13 @@ ANTERIOR_FRAC = 0.60             # keep the anterior 60% of AP extent as candida
 # --- Segmentation consistency gate --------------------------------------------
 # Sanity bounds on each vertebra label (full mask: body + posterior elements).
 SEG_MIN_BODY_VOL_MM3 = 1500.0    # reject specks (e.g. a 37-voxel mislabel)
-SEG_MAX_BODY_VOL_MM3 = 90000.0   # reject merged/over-grown blobs
+# Ceiling for a single full vertebra label (body + posterior elements). On
+# thick-slice (~3.75 mm) scans of large patients a legitimate lumbar label
+# reaches ~90-100 cm3, so 90 cm3 was too tight and falsely rejected clean
+# levels (e.g. an L3 at 98 cm3 next to an 87 cm3 L2 that passed). 140 cm3 keeps
+# single vertebrae valid while still catching true two-level merges (~175 cm3+)
+# and over-grown sacrum blobs (~200 cm3+).
+SEG_MAX_BODY_VOL_MM3 = 140000.0  # reject merged/over-grown blobs
 SEG_MIN_CC_FRACTION = 0.55       # largest connected component / total
 SEG_MAX_Z_OVERLAP_FRAC = 0.50    # SI overlap between NON-adjacent levels
 SEG_MIN_STEP_MM = 8.0            # per-VERT_ORDER-step centroid spacing (SI)
