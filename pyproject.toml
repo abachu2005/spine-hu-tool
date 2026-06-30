@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spine-hu-tool"
+version = "0.1.0"
+description = "Deterministic, physician-reviewable trabecular vertebral-HU measurement from CT"
+readme = "README.md"
+requires-python = ">=3.10"
+# Core client deps only -- intentionally NO torch / TotalSegmentator. The
+# desktop client offloads segmentation to the hosted Cloud Run service, so it
+# stays lean (hundreds of MB packaged instead of multiple GB).
+dependencies = [
+    "numpy", "scipy", "nibabel", "pydicom", "SimpleITK", "matplotlib",
+    "PySide6", "pyqtgraph", "requests",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+# Heavy ML stack for running TotalSegmentator locally instead of on the cloud.
+# Only needed on a machine/server that does segmentation itself.
+local-seg = ["TotalSegmentator", "torch"]
+# Server-side deps for the Cloud Run segmentation service.
+server = ["fastapi", "uvicorn[standard]", "python-multipart", "google-cloud-storage", "google-auth"]
+
+[project.scripts]
+spine-hu = "spine_hu_tool.app.cli:main"
+spine-hu-server = "spine_hu_tool.server.app:main"
+
+[project.gui-scripts]
+spine-hu-gui = "spine_hu_tool.app.viewer:main"
+
+[tool.setuptools.packages.find]
+include = ["spine_hu_tool*"]
+
+[tool.pytest.ini_options]
+testpaths = ["spine_hu_tool/tests"]

@@ -1,0 +1,33 @@
+# GPU (NVIDIA L4) segmentation service for Cloud Run.
+# Same as the CPU image but with CUDA-enabled torch/torchvision so
+# TotalSegmentator runs on the GPU (seconds instead of minutes). Deploy with
+#   --gpu 1 --gpu-type nvidia-l4 --no-cpu-throttling  and env SPINE_HU_DEVICE=gpu
+# The CUDA runtime ships inside the torch wheels; Cloud Run provides the driver.
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 git curl && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    TOTALSEG_HOME_DIR=/opt/totalseg
+
+WORKDIR /app
+
+COPY deploy/requirements-server.txt .
+# CUDA torch + matching torchvision from the default index (CUDA builds), then
+# the rest. Pin torch to match the CPU image; torchvision resolves to its pair.
+RUN pip install torch==2.12.1 torchvision && \
+    pip install -r requirements-server.txt
+
+COPY spine_hu_tool ./spine_hu_tool
+COPY pyproject.toml README.md ./
+RUN pip install -e . --no-deps
+
+# Bake weights: 297 = fast (3 mm), 291-295 = full-resolution (1.5 mm).
+RUN python -c "from totalsegmentator.libs import download_pretrained_weights; [download_pretrained_weights(t) for t in (297, 291, 292, 293, 294, 295)]" \
+    || echo "WARN: weight pre-download skipped; will download on first request"
+
+EXPOSE 8080
+CMD ["python", "-m", "spine_hu_tool.server.app"]

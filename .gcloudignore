@@ -1,0 +1,18 @@
+# What NOT to upload to Cloud Build. The image only needs the package source +
+# pyproject + README + deploy files; everything else just bloats the upload.
+.venv/
+.git/
+.gcloudignore
+Test Data/
+work/
+scratch/
+validation/
+results/
+agent-transcripts/
+*.rtfd/
+**/__pycache__/
+**/*.pyc
+**/.spine_hu_cache/
+*.nii
+*.nii.gz
+*.zip

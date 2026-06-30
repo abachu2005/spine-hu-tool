@@ -1,0 +1,140 @@
+# Spine Vertebral-HU Tool
+
+A deterministic, physician-reviewable tool that measures **trabecular Hounsfield
+Units (HU)** in vertebral bodies from CT — an opportunistic bone-density signal.
+
+> **Design philosophy: "ML for the eyes, math for the ruler."**
+> The only machine-learning component is vertebra localization/segmentation
+> (pretrained [TotalSegmentator](https://github.com/wasserth/TotalSegmentator),
+> used off the shelf — never trained by us). Every measurement step — body
+> isolation, local axes, ROI placement, HU statistics, and QC — is deterministic
+> image processing a physician can audit and override.
+
+## What it does
+
+1. **Ingest** a DICOM folder and auto-select the real axial CT series (rejecting
+   scouts, reformats, and secondary captures — data quality only).
+2. **Segment** each vertebra (TotalSegmentator) and **tag levels** for metal
+   hardware / streak artifact, auto-excluding instrumented levels and their
+   immediate neighbors.
+3. **Isolate the vertebral body** from the posterior elements (morphological).
+4. Build a **per-vertebra local frame** (LR/AP/SI) so placement is tilt-aware.
+5. Place a **centroid-anchored sphere** in the central trabecular bone, sized to
+   stay clear of cortex (size-proportional margin + adaptive radius).
+6. Compute **HU statistics** and **QC flags** (metal proximity, heterogeneity,
+   clipping, partial vertebra, cortical-tail hint) → pass / review / fail.
+7. **Review** in a greyscale, PACS-style desktop app (accept / reject / adjust).
+8. **Export** CSV/JSON, tri-planar overlays, masks (NIfTI), a full
+   reproducibility record, and an audit trail.
+
+## Why a centroid sphere
+
+The earlier "largest safe sphere at the distance-transform maximum" landed in
+different anatomical spots across scans, giving an **L1 scan-rescan gap of ~37
+HU**. Anchoring the sphere at the body centroid in its local frame is
+anatomically standardized and reproducible: on the project test data the L1 gap
+dropped to **~7 HU**, and fully-imaged overlapping levels agree within
+**~14–19 HU** (kernel/resolution noise). See `validation/REPORT.md`.
+
+## Install
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+# or, as a package (provides the spine-hu / spine-hu-gui commands):
+pip install -e .
+```
+
+## Usage
+
+### Desktop review app (physician-facing)
+
+```bash
+spine-hu-gui            # or: python -m spine_hu_tool.app.viewer
+```
+
+Open a DICOM folder → the axial CT is auto-selected → **Analyze** → review levels
+in the tri-planar greyscale viewer (green = pass, amber = review, red =
+excluded/metal). Toggle body/inner/ROI overlays, change window/level, adjust the
+ROI radius, click to move the center, **Accept/Reject**, then **Export**.
+
+### Command line
+
+```bash
+# Full pipeline from DICOM (runs + caches segmentation):
+spine-hu measure --dicom "Test Data/100007EC" --all-clean --out results/thoracic
+
+# Quick run from cached NIfTI volume + TotalSegmentator labels:
+spine-hu measure --volume work/thoracic.nii.gz --seg work/thoracic_seg.nii \
+                 --level L1 --level T12 --out results/quick
+```
+
+Useful flags: `--roi-mode {centroid_sphere,largest_safe_sphere,trabecular_core}`,
+`--fast` (3 mm segmentation), `--no-overlays`, `--no-masks`,
+`--seg-url <URL>` / `--api-key <KEY>` (offload segmentation to a remote server).
+
+### Cloud segmentation (offload the heavy ML step)
+
+TotalSegmentator is the only memory-heavy step (it OOMs ~8 GB laptops). It can
+run on a remote service instead, keeping the local app light — only the CT
+volume is uploaded; all measurement, QC, and review stay local.
+
+- **Run the server locally** (for testing): `pip install -e ".[server]"` then
+  `spine-hu-server` (listens on `$PORT`, default 8080).
+- **Deploy to Google Cloud Run** (scale-to-zero, pay only while segmenting):
+  see [`deploy/DEPLOY.md`](deploy/DEPLOY.md).
+- **Point the app at it** — set once, then use the GUI/CLI normally:
+
+```bash
+export SPINE_HU_SEG_URL=https://spine-hu-seg-xxxx.run.app
+export SPINE_HU_API_KEY=your-key        # if the service requires auth
+```
+
+  Or paste the URL into the landing-screen field in the desktop app. Backend
+  selection is transparent: a configured URL → remote, otherwise local. Results
+  are cached identically either way, so switching never re-segments a done case.
+
+## Project structure
+
+```
+spine_hu_tool/
+  io/            DICOM loading, series selection, NIfTI helpers
+  preprocessing/ HU rescale math
+  segmentation/  TotalSegmentator runner (the only ML) + level helpers
+  geometry/      coordinate transforms, morphology, per-vertebra local axes
+  roi/           body isolation, distance transform, ROI placement modes
+  measurement/   HU stats, ROI QC, per-level metal/streak tagging
+  visualization/ greyscale tri-planar overlay rendering
+  export/        CSV/JSON/overlay/mask + reproducibility + audit trail
+  app/           review-state backend, PySide6 viewer, CLI
+  server/        FastAPI segmentation service (offloadable to Cloud Run)
+  validation/    internal-consistency report generation
+  tests/         synthetic-phantom unit tests + cached integration tests
+deploy/          Dockerfile + Cloud Run deploy guide for the server
+```
+
+## Testing
+
+```bash
+QT_QPA_PLATFORM=offscreen pytest -q
+```
+
+Unit tests run on synthetic phantoms (no ML). Integration and series-selection
+tests use the cached test data when present and skip otherwise.
+
+## Validation & limitations
+
+- Validation is by **internal consistency** (scan-rescan, ROI-mode agreement)
+  and **literature anchoring** (L1 trabecular: ~<110 HU osteoporosis, >160 HU
+  normal; Pickhardt et al.) — there is no external ground-truth calibration.
+- **Intended use:** a physician-reviewed screening/quantification aid, **not** a
+  standalone diagnostic device.
+- Trabecular HU depends on scanner, kernel, kVp, and contrast — compare only
+  within consistent protocols; report STANDARD-kernel non-contrast values.
+- Levels with hardware (or within the streak buffer) are excluded and must not
+  be reported; partial/edge vertebrae are flagged for review.
+
+## Out of scope
+
+PHI/de-identification handling; training a custom segmentation model; large-scale
+batch infrastructure; formal regulatory submission (intended use documented only).

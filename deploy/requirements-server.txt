@@ -1,0 +1,14 @@
+# Server-side deps (no UI stack). Install torch from the CPU index in the
+# Dockerfile to avoid pulling large CUDA wheels for a CPU Cloud Run service.
+numpy==2.5.0
+scipy==1.18.0
+nibabel==5.4.2
+pydicom==3.0.2
+SimpleITK==2.5.5
+TotalSegmentator==2.14.0
+torch==2.12.1
+fastapi
+uvicorn[standard]
+python-multipart
+google-cloud-storage
+google-auth

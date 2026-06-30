@@ -1,0 +1,12 @@
+.venv
+Test Data
+work
+scratch
+validation
+results
+**/__pycache__
+**/*.pyc
+**/.spine_hu_cache
+*.nii
+*.nii.gz
+.git

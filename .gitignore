@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# PyInstaller / packaging build artifacts
+packaging/build/
+packaging/dist/
+build/
+dist/
+*.spec.bak
+
+# Local caches / scratch outputs
+.spine_hu_cache/
+
+# Patient DICOM and derived scratch data -- never push (size + PHI).
+# Keep only the small dev/analysis scripts under work/.
+Test Data/
+scratch/
+results/
+work/*
+!work/*.py
+work/cloud_run_credentials.txt
+
+# OS cruft
+.DS_Store

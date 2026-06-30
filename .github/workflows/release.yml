@@ -1,0 +1,182 @@
+name: Build installers
+
+# One tag push -> three native installers, published to a GitHub Release
+# (the "install via cloud" download page physicians visit).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Surface the gating secrets as env so step `if:` conditions can check them.
+    # Empty when the secret is unset -> the optional signing steps are skipped.
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: macos-dmg
+          - os: windows-latest
+            artifact: windows-setup
+          - os: ubuntu-latest
+            artifact: linux-appimage
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install client + build deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # core client deps only (NO torch / TotalSegmentator)
+          pip install .
+          pip install pyinstaller pillow
+
+      - name: Generate icons
+        shell: bash
+        run: python packaging/make_icons.py
+
+      - name: Build app bundle (PyInstaller)
+        shell: bash
+        run: |
+          pyinstaller packaging/spine_hu.spec --noconfirm \
+            --distpath packaging/dist --workpath packaging/build
+
+      # ---- macOS: optional signing, then .dmg ---------------------------
+      # Signing runs only when the cert secret is configured (see
+      # packaging/SIGNING.md); otherwise the app ships unsigned.
+      - name: Sign .app (macOS, optional)
+        if: runner.os == 'macOS' && env.MACOS_CERT_P12 != ''
+        shell: bash
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          echo "$MACOS_CERT_P12" | base64 --decode > /tmp/cert.p12
+          security create-keychain -p ci build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci build.keychain
+          security import /tmp/cert.p12 -k build.keychain \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci build.keychain
+          codesign --deep --force --options runtime --timestamp \
+            --sign "$MACOS_SIGN_IDENTITY" "packaging/dist/Spine HU Tool.app"
+
+      - name: Build .dmg (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install create-dmg || true
+          bash packaging/macos/build_dmg.sh
+          mkdir -p artifacts
+          mv "packaging/dist/Spine HU Tool.dmg" "artifacts/SpineHUTool-macos.dmg"
+
+      - name: Notarize .dmg (macOS, optional)
+        if: runner.os == 'macOS' && env.APPLE_ID != ''
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool submit "artifacts/SpineHUTool-macos.dmg" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "artifacts/SpineHUTool-macos.dmg"
+
+      # ---- Windows: optional signing + Inno Setup wizard ---------------
+      - name: Decode signing cert (Windows, optional)
+        if: runner.os == 'Windows' && env.WINDOWS_CERT_PFX != ''
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String($env:WINDOWS_CERT_PFX))
+
+      - name: Sign app exe (Windows, optional)
+        if: runner.os == 'Windows' && env.WINDOWS_CERT_PFX != ''
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $st = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1).FullName
+          & $st sign /f "$env:RUNNER_TEMP\cert.pfx" /p $env:WINDOWS_CERT_PASSWORD /tr http://timestamp.digicert.com /td sha256 /fd sha256 "packaging\dist\Spine HU Tool\Spine HU Tool.exe"
+
+      - name: Build setup.exe (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging\windows\installer.iss
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Move-Item "packaging\dist\SpineHUTool-Setup.exe" "artifacts\SpineHUTool-windows-setup.exe"
+
+      - name: Sign setup.exe (Windows, optional)
+        if: runner.os == 'Windows' && env.WINDOWS_CERT_PFX != ''
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $st = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1).FullName
+          & $st sign /f "$env:RUNNER_TEMP\cert.pfx" /p $env:WINDOWS_CERT_PASSWORD /tr http://timestamp.digicert.com /td sha256 /fd sha256 "artifacts\SpineHUTool-windows-setup.exe"
+
+      # ---- Linux: AppImage ---------------------------------------------
+      - name: Build AppImage (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse2 desktop-file-utils
+          bash packaging/linux/build_appimage.sh
+          mkdir -p artifacts
+          mv packaging/dist/SpineHUTool-x86_64.AppImage artifacts/SpineHUTool-linux-x86_64.AppImage
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifacts/*
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all installers
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true
+          body: |
+            ## Spine HU Tool — desktop installers
+
+            Download the installer for your OS:
+            - **macOS**: `SpineHUTool-macos.dmg` (open, drag to Applications)
+            - **Windows**: `SpineHUTool-windows-setup.exe` (setup wizard)
+            - **Linux**: `SpineHUTool-linux-x86_64.AppImage` (mark executable, run)
+
+            Segmentation runs on the hosted cloud service. **Pilot / non-PHI use only.**

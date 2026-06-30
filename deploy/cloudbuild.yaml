@@ -1,0 +1,15 @@
+# Cloud Build: build the segmentation image (custom Dockerfile path) and push
+# to Artifact Registry. Invoke with:
+#   gcloud builds submit --config deploy/cloudbuild.yaml \
+#       --substitutions=_IMAGE=REGION-docker.pkg.dev/PROJECT/REPO/seg:latest .
+substitutions:
+  _DOCKERFILE: deploy/Dockerfile
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "${_IMAGE}", "-f", "${_DOCKERFILE}", "."]
+images:
+  - "${_IMAGE}"
+# Bigger machine + longer timeout: torch + TotalSegmentator + weights are heavy.
+options:
+  machineType: E2_HIGHCPU_8
+timeout: 3600s

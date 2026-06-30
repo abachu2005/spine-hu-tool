@@ -1,0 +1,24 @@
+# Spine Vertebral-HU Tool -- pinned dependencies
+# Core numerics / imaging
+numpy==2.5.0
+scipy==1.18.0
+nibabel==5.4.2
+pydicom==3.0.2
+SimpleITK==2.5.5
+matplotlib==3.11.0
+
+# Remote segmentation client (talk to the Cloud Run service)
+requests==2.34.2
+
+# Segmentation (the only ML component; pretrained, used off the shelf).
+# Only needed for LOCAL segmentation -- if you point the app at a remote
+# segmentation server (SPINE_HU_SEG_URL), you can skip torch/TotalSegmentator.
+TotalSegmentator==2.14.0
+torch==2.12.1
+
+# Physician review UI (Phase 7)
+PySide6==6.11.1
+pyqtgraph==0.14.0
+
+# Test runner
+pytest==9.1.1
