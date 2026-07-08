@@ -75,3 +75,17 @@ def test_speck_volume_rejected():
     out = check_segmentation(seg, SPACING)
     assert not out["levels"]["L4"]["valid"]
     assert any("small" in r for r in out["levels"]["L4"]["reasons"])
+
+
+def test_suspect_from_bad_level_carries_per_level_reason_not_global():
+    # A single bad level among well-formed ones makes the seg 'suspect' WITHOUT a
+    # global reason -- the failure is discoverable only per level. This is the
+    # real case (Anon2's speck T8 / ballooned sacrum) the CLI summary must still
+    # explain instead of printing a blank reason.
+    seg = _well_formed()
+    X, Y, Z = _phys_grid(SHAPE, SPACING)
+    seg[_ellipsoid(X, Y, Z, (30, 25, 170), (1.5, 1.5, 1.5))] = label_id_for("L4")
+    out = check_segmentation(seg, SPACING)
+    assert out["seg_status"] == "suspect"
+    assert out["global_reasons"] == []
+    assert out["levels"]["L4"]["reasons"]

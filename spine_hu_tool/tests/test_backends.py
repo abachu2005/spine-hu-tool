@@ -175,3 +175,50 @@ def test_segment_remote_error_raises(monkeypatch, tmp_path):
         assert False, "expected RuntimeError"
     except RuntimeError as e:
         assert "boom" in str(e)
+
+
+def test_adaptive_timeout_scales_with_slices():
+    # A big full-res scan gets a longer deadline than a small one (up to a cap),
+    # and fast mode always gets a shorter deadline than full-res for the same scan.
+    small = Volume(hu=np.zeros((8, 8, 10), dtype=np.float32), spacing=(1., 1., 2.))
+    big = Volume(hu=np.zeros((8, 8, 400), dtype=np.float32), spacing=(1., 1., 2.))
+    assert backends._adaptive_timeout(small, fast=False) == 1200.0   # floor
+    assert backends._adaptive_timeout(big, fast=False) == 1800.0     # ceiling
+    assert backends._adaptive_timeout(big, fast=False) > \
+        backends._adaptive_timeout(big, fast=True)
+
+
+def test_segment_falls_back_to_fast_on_timeout(monkeypatch, tmp_path):
+    # A full-resolution remote job that exceeds its deadline must NOT hard-fail:
+    # it transparently retries in fast (3 mm) mode and still returns a mask.
+    mask = np.zeros((12, 12, 12), dtype=np.uint8)
+    mask[3:6, 3:6, 3:6] = 28
+    truth_path = str(tmp_path / "truth_seg.nii.gz")
+    save_mask_nifti(mask, (1.0, 1.0, 2.0), truth_path)
+
+    # the (only) status poll reports success; the first (full-res) attempt never
+    # reaches it because we force its deadline to expire immediately.
+    cap = _install_fake_flow(monkeypatch, truth_path, status_payloads=[
+        {"status": "done", "result_url": "https://gcs.example/signed-get"},
+    ])
+    msgs = []
+    seg = backends.segment(_volume(), str(tmp_path), "case", fast=False,
+                           seg_url="http://server:8080", timeout=0.0,
+                           progress=lambda m, _f: msgs.append(m))
+
+    # two segmentation jobs were started: full-res (timed out) then fast fallback
+    starts = [p for p in cap["posts"] if p["url"].endswith("/segment-async")]
+    assert [s["json"]["fast"] for s in starts] == [False, True]
+    assert any("fast (3 mm) mode" in m for m in msgs)
+    assert int(seg.max()) == 28 and seg.shape == (12, 12, 12)
+
+
+def test_segment_no_fallback_when_already_fast(monkeypatch, tmp_path):
+    # a fast job that times out has nothing lighter to fall back to -> it raises.
+    _install_fake_flow(monkeypatch, truth_path=None, status_payloads=[])
+    try:
+        backends.segment(_volume(), str(tmp_path), "case", fast=True,
+                         seg_url="http://server:8080", timeout=0.0)
+        assert False, "expected RuntimeError"
+    except RuntimeError as e:
+        assert "timed out" in str(e)

@@ -69,10 +69,32 @@ def resolve_api_key(api_key: Optional[str]) -> Optional[str]:
             or _from_creds_file("SPINE_HU_API_KEY") or DEFAULT_API_KEY)
 
 
+def _adaptive_timeout(volume: Volume, fast: bool) -> float:
+    """Poll deadline (seconds) scaled to the scan size.
+
+    Remote segmentation runs on CPU and, on a scale-to-zero Cloud Run instance,
+    the background worker is CPU-throttled between the client's short status
+    polls, so wall-clock time grows roughly linearly with the number of slices.
+    A large full-resolution scan (e.g. a 250+ slice chest/abdomen CT) can exceed
+    the old fixed 1200 s cap and hard-fail. Scale the deadline with slice count
+    (with a floor and a sane ceiling) so realistic scans finish, and let the
+    fast-mode fallback in :func:`segment` catch the extreme tail.
+    """
+    try:
+        slices = int(volume.hu.shape[2]) if volume.hu.ndim == 3 else 0
+    except Exception:
+        slices = 0
+    if fast:
+        return float(min(1200.0, max(600.0, slices * 4.0)))
+    # ~10 s/slice observed on a throttled CPU instance; add margin, cap so we
+    # fall back to fast mode rather than making the user wait indefinitely.
+    return float(min(1800.0, max(1200.0, slices * 12.0)))
+
+
 def segment(volume: Volume, work_dir: str, name: str, *,
             fast: bool = True, force: bool = False, local: bool = False,
             seg_url: Optional[str] = None, api_key: Optional[str] = None,
-            timeout: float = 1200.0, progress: ProgressCb = None):
+            timeout: Optional[float] = None, progress: ProgressCb = None):
     """Return the multilabel segmentation array, running locally or remotely.
 
     Remote and local share the same on-disk cache (`{name}_seg.nii.gz` in
@@ -81,13 +103,31 @@ def segment(volume: Volume, work_dir: str, name: str, *,
     `local=True` forces on-machine segmentation regardless of any configured
     server URL (env / baked-in default). Otherwise the remote endpoint is
     resolved and used; only when no URL resolves does it fall back to local.
+
+    Robustness: a full-resolution remote job that exceeds its (size-aware)
+    deadline does not hard-fail. Because the fast (3 mm) mask is resampled to the
+    full-resolution grid and leaves the deterministic ROI placement intact, we
+    transparently retry once in fast mode so the physician still gets a
+    reviewable result, surfacing a clear warning via `progress`.
     """
     url = None if local else resolve_seg_url(seg_url)
     if url is None:
         return run_segmentation(volume, work_dir, name, fast=fast, force=force)
-    return _segment_remote(volume, work_dir, name, url, api_key,
-                           fast=fast, force=force, timeout=timeout,
-                           progress=progress)
+    eff_timeout = timeout if timeout is not None else _adaptive_timeout(volume, fast)
+    try:
+        return _segment_remote(volume, work_dir, name, url, api_key,
+                               fast=fast, force=force, timeout=eff_timeout,
+                               progress=progress)
+    except RuntimeError as exc:
+        if fast or "timed out" not in str(exc).lower():
+            raise
+        if progress:
+            progress("Full-resolution segmentation is taking too long on the "
+                     "cloud service; retrying in fast (3 mm) mode...", -1.0)
+        return _segment_remote(volume, work_dir, name, url, api_key,
+                               fast=True, force=force,
+                               timeout=_adaptive_timeout(volume, True),
+                               progress=progress)
 
 
 def _segment_remote(volume: Volume, work_dir: str, name: str, url: str,
