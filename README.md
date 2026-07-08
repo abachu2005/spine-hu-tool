@@ -10,6 +10,10 @@ Units (HU)** in vertebral bodies from CT — an opportunistic bone-density signa
 > isolation, local axes, ROI placement, HU statistics, and QC — is deterministic
 > image processing a physician can audit and override.
 
+> **Docs:** for the design rationale and a per-package guide, see
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Every subpackage under
+> `spine_hu_tool/` also has its own `README.md` explaining what it does and why.
+
 ## What it does
 
 1. **Ingest** a DICOM folder and auto-select the real axial CT series (rejecting
@@ -87,8 +91,9 @@ spine-hu measure --volume work/thoracic.nii.gz --seg work/thoracic_seg.nii \
                  --level L1 --level T12 --out results/quick
 ```
 
-Useful flags: `--roi-mode {centroid_sphere,largest_safe_sphere,trabecular_core}`,
-`--fast` (3 mm segmentation), `--no-overlays`, `--no-masks`,
+Useful flags: `--roi-mode {centroid_volume_sphere,cylinder_volume,lowest_attenuation_sphere}`
+(default `centroid_volume_sphere`; exposed in the GUI as **centroid / cylinder /
+westerhoff**), `--fast` (3 mm segmentation), `--no-overlays`, `--no-masks`,
 `--seg-url <URL>` / `--api-key <KEY>` (offload segmentation to a remote server).
 
 ### Cloud segmentation (offload the heavy ML step)

@@ -127,18 +127,24 @@ def test_excluded_level_cannot_be_accepted_or_rejected():
 def test_chooser_collapses_to_one_row_per_study(test_data_dir):
     # opening a parent folder shows ONE selectable row per study (kernel
     # duplicates like STANDARD+BONE collapsed), and preselects a real series.
+    # Asserted as an invariant so adding more studies/patients doesn't break it.
     from spine_hu_tool.app.viewer import MainWindow
+    from spine_hu_tool.io.series_selector import select_ct_series
     win = MainWindow()
     best = win._load_folder(test_data_dir)
     assert best is not None
-    # this test data is a single patient with exactly two studies (T + L spine)
-    assert len(win._row_series) == 2
-    # single patient -> no disabled header rows, every row is a selectable study
-    model = win.series_combo.model()
-    assert all(model.item(i).isEnabled() for i in range(win.series_combo.count()))
-    # preselected row resolves to a SeriesInfo (the best axial CT)
+
+    _b, cands = select_ct_series(test_data_dir)
+    axial = [c for c in cands if c.is_axial_ct]
+    n_studies = len({c.study_uid for c in axial})
+    # one selectable row per distinct study (kernel duplicates collapsed)
+    assert len(win._row_series) == n_studies
+    assert len({s.study_uid for s in win._row_series.values()}) == n_studies
+    # preselected row resolves to the best axial CT
     sel = win._row_series.get(win.series_combo.currentIndex())
     assert sel is not None and sel.series_uid == best.series_uid
-    # the two studies are distinct acquisitions, not the same data twice
-    uids = {s.study_uid for s in win._row_series.values()}
-    assert len(uids) == 2
+    # every *enabled* (non-header) combo row maps to a selectable SeriesInfo
+    model = win.series_combo.model()
+    for i in range(win.series_combo.count()):
+        if model.item(i).isEnabled():
+            assert i in win._row_series

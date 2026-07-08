@@ -16,11 +16,31 @@ from ..export.writers import export_case
 from ..roi.modes import EXPOSED_MODES, DEFAULT_MODE
 
 
+def _seg_status_reasons(case) -> list[str]:
+    """Human-readable reasons a segmentation was flagged suspect/invalid.
+
+    Prefer the global reasons (ordering/spacing/contiguity), but fall back to a
+    compact summary of the per-level failures. Without this, a segmentation that
+    is 'suspect' purely because of a few bad *levels* (e.g. a speck-sized T8 or
+    an over-segmented sacrum) prints an empty reason, which reads like a bug.
+    """
+    check = case.get("seg_check") or {}
+    reasons = list(check.get("global_reasons") or [])
+    if reasons:
+        return reasons
+    per_level = []
+    for lvl, v in (check.get("levels") or {}).items():
+        if not v.get("valid", True) and v.get("reasons"):
+            per_level.append(f"{lvl}: {'; '.join(v['reasons'])}")
+    return per_level
+
+
 def _print_summary(case):
     seg_status = case.get("seg_status")
     if seg_status and seg_status != "ok":
-        reasons = (case.get("seg_check") or {}).get("global_reasons", [])
-        print(f"\n!! SEGMENTATION {seg_status.upper()}: " + "; ".join(reasons))
+        reasons = _seg_status_reasons(case)
+        detail = "; ".join(reasons) if reasons else "per-level anomalies (see level table)"
+        print(f"\n!! SEGMENTATION {seg_status.upper()}: " + detail)
         if seg_status == "invalid":
             print("   Affected levels were excluded; consider re-running/re-acquiring.")
     cal = case.get("calibration") or {}

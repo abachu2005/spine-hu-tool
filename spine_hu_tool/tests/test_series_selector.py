@@ -40,19 +40,49 @@ def test_parent_folder_with_multiple_studies_is_grouped(test_data_dir):
 
 
 def test_list_studies_collapses_kernel_duplicates(test_data_dir):
-    # the parent folder has 4 axial series = 2 studies x {STANDARD, BONE} kernels;
-    # list_studies must collapse each study to ONE best (STANDARD) series.
+    # list_studies must collapse each STUDY to ONE best series (dropping kernel
+    # duplicates like STANDARD+BONE), no matter how many studies/patients the
+    # parent folder holds. Asserting the invariant -- one row per distinct study,
+    # each the best-scored recon for that study -- keeps this robust as more test
+    # data is dropped into the folder.
     best, cands = select_ct_series(test_data_dir)
+    axial = [c for c in cands if c.is_axial_ct]
+    n_studies = len({c.study_uid for c in axial})
+    assert n_studies >= 2
+
     patients = list_studies(cands, axial_only=True)
     rows = [s for _p, studies in patients for s in studies]
-    assert len(rows) == 2                                   # one per study, not 4
-    assert len({s.study_uid for s in rows}) == 2            # the two real studies
+    assert len(rows) == n_studies                       # exactly one row per study
+    assert len({s.study_uid for s in rows}) == n_studies
+
+    by_study: dict[str, list] = {}
+    for c in axial:
+        by_study.setdefault(c.study_uid, []).append(c)
     for s in rows:
-        assert "STANDARD" in s.kernel.upper()               # bone duplicates dropped
-    # single patient in this dataset
-    assert len(patients) == 1
-    # the global best is among (and is) the preselected study series
+        best_for_study = max(by_study[s.study_uid], key=lambda x: x.score)
+        assert s.series_uid == best_for_study.series_uid   # kernel dup dropped
+    # the global best is among the preselected study rows
     assert any(s.series_uid == best.series_uid for s in rows)
+
+
+def test_selects_standard_axial_for_new_anon_studies(test_data_dir):
+    # The newly-added Anon studies must auto-select a real STANDARD axial CT and
+    # reject their reformatted/secondary recons (Anon2/Anon3 ship both).
+    subs = [s for s in ("Anon1", "Anon2", "Anon3")
+            if os.path.isdir(os.path.join(test_data_dir, s))]
+    if not subs:
+        import pytest
+        pytest.skip("new Anon studies not present")
+    for sub in subs:
+        best, cands = select_ct_series(os.path.join(test_data_dir, sub))
+        assert best is not None and best.is_axial_ct
+        assert "STANDARD" in best.kernel.upper()
+        assert "ORIGINAL" in best.image_type and "PRIMARY" in best.image_type
+        assert best.reject_reason is None
+        # any reformatted/secondary recon present must be rejected, not chosen
+        for c in cands:
+            if "REFORMATTED" in c.image_type or "SECONDARY" in c.image_type:
+                assert not c.is_axial_ct
 
 
 def test_group_series_falls_back_when_no_axial(test_data_dir):

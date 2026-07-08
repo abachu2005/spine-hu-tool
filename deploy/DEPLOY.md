@@ -35,6 +35,7 @@ gcloud run deploy $SERVICE \
   --image gcr.io/$PROJECT/$SERVICE \
   --region $REGION \
   --memory 16Gi --cpu 4 \
+  --no-cpu-throttling \
   --timeout 900 \
   --concurrency 1 \
   --min-instances 0 --max-instances 3 \
@@ -42,9 +43,23 @@ gcloud run deploy $SERVICE \
   --no-allow-unauthenticated
 ```
 - `--concurrency 1`: one big job per instance (segmentation is memory-heavy).
+- `--no-cpu-throttling` (**important**): segmentation runs in a background thread
+  after `/segment-async` returns, and the client then makes only short status
+  polls. With the Cloud Run default ("CPU allocated only during request
+  processing") that background worker is throttled to ~0 CPU between polls, so a
+  full-resolution job crawls -- a ~115-slice scan took ~18 min and a ~250-slice
+  scan blew past the client deadline entirely. Keeping the CPU always allocated
+  lets the worker run at full speed (seconds-to-minutes). The desktop client also
+  now falls back to fast (3 mm) mode if a full-res job still times out, but that
+  is a safety net -- fix the throttling here for good full-res performance.
 - `--min-instances 0`: scale to zero = no idle cost (first request after idle
   pays a cold start; the model is pre-baked so it's just container start).
 - `--no-allow-unauthenticated` + `SPINE_HU_API_KEY`: keep it private.
+
+> Speed tip: for the spine use-case only the vertebra/sacrum labels are needed,
+> so passing `--roi_subset` (vertebrae + sacrum) to TotalSegmentator would cut
+> full-res runtime further. Not enabled yet (kept as the full multilabel run) to
+> avoid changing cached-mask contents mid-pilot.
 
 > Optional GPU (faster, ~seconds/scan): add `--gpu 1 --gpu-type nvidia-l4`
 > and build with a CUDA torch wheel instead of the CPU one.
