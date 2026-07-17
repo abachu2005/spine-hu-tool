@@ -89,12 +89,14 @@ def analyze_dataset(folder: str, series: Optional[SeriesInfo] = None,
         if progress:
             progress(msg, frac)
 
-    # Resolution policy: full-res (1.5 mm) gives the best ROI placement but
-    # needs ~12 GB RAM, so default to it only when segmentation is offloaded to
-    # the cloud; run laptop-local segmentation in fast (3 mm) mode by default.
+    # Resolution policy: full-res (1.5 mm) gives the best ROI placement and is
+    # the default for BOTH cloud and local (the offline build bundles the
+    # full-res weights). It needs ~12 GB RAM locally, so the GUI warns and lets
+    # the user pick fast (3 mm) on a low-RAM machine; callers can also pass an
+    # explicit `fast` to override.
     remote = (not local) and resolve_seg_url(seg_url) is not None
     if fast is None:
-        fast = not remote
+        fast = False
 
     # Progress model:
     #   ingest/select : 0.00 - 0.08 (determinate)
