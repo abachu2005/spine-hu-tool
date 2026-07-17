@@ -142,17 +142,18 @@ class AnalyzeWorker(QtCore.QThread):
     failed = QtCore.Signal(str)
 
     def __init__(self, folder, series, mode, reviewer, seg_url=None, api_key=None,
-                 local=False):
+                 local=False, fast=None):
         super().__init__()
         self.folder, self.series, self.mode, self.reviewer = folder, series, mode, reviewer
         self.seg_url, self.api_key, self.local = seg_url, api_key, local
+        self.fast = fast
 
     def run(self):
         try:
             st = analyze_dataset(self.folder, series=self.series, mode=self.mode,
                                  only_clean=True, reviewer=self.reviewer,
                                  seg_url=self.seg_url, api_key=self.api_key,
-                                 local=self.local,
+                                 local=self.local, fast=self.fast,
                                  progress=lambda m, f: self.progress.emit(m, f))
             self.finished_state.emit(st)
         except Exception as e:  # surfaced to the user
@@ -262,6 +263,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "Process the scan locally with TotalSegmentator instead of the cloud "
             "service. Needs more RAM/CPU; set it up once with the button below.")
         self.local_seg_cb.toggled.connect(self._on_local_toggled)
+        # Segmentation resolution: full-res (1.5 mm, matches cloud, best ROI
+        # placement) vs fast (3 mm, much lighter on RAM). Full-res is the
+        # default; a low-RAM machine is warned before a full-res local run.
+        self.res_combo = QtWidgets.QComboBox(); self.res_combo.setFixedWidth(420)
+        self.res_combo.addItem("Full resolution (1.5 mm, recommended)", False)
+        self.res_combo.addItem("Fast (3 mm, low memory)", True)
         # One-time installer for the local ML runtime (torch + TotalSegmentator
         # + weights) into a user-managed environment outside the app bundle.
         self.setup_local_btn = QtWidgets.QPushButton("Set up local segmentation...")
@@ -281,8 +288,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setVisible(False)
         self.status_lbl = QtWidgets.QLabel(""); self.status_lbl.setAlignment(QtCore.Qt.AlignCenter)
         for widget in (title, sub, btn, self.seg_url_edit, self.local_seg_cb,
-                       self.setup_local_btn, self.roi_mode_combo, self.series_combo,
-                       self.analyze_btn, self.progress, self.status_lbl):
+                       self.res_combo, self.setup_local_btn, self.roi_mode_combo,
+                       self.series_combo, self.analyze_btn, self.progress,
+                       self.status_lbl):
             v.addWidget(widget, alignment=QtCore.Qt.AlignHCenter)
         v.addStretch()
         return w
@@ -464,16 +472,54 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_lbl.setText("No selectable CT series in this folder.")
             return
         self.series = series
-        self.progress.setVisible(True); self.analyze_btn.setEnabled(False)
         local = self.local_seg_cb.isChecked()
+        fast = bool(self.res_combo.currentData())
+        # Guard a full-res LOCAL run on a machine that likely lacks the RAM: the
+        # segmentation runs on this computer only when local is checked, so the
+        # crash risk (and the warning) only applies then.
+        if local and not fast and not self._confirm_fullres_ram():
+            return
+        self.progress.setVisible(True); self.analyze_btn.setEnabled(False)
         seg_url = self.seg_url_edit.text().strip() or None
         mode = self.roi_mode_combo.currentData() or DEFAULT_MODE
         self.worker = AnalyzeWorker(self.folder, self.series, mode,
-                                    "physician", seg_url=seg_url, local=local)
+                                    "physician", seg_url=seg_url, local=local,
+                                    fast=fast)
         self.worker.progress.connect(self._on_progress)
         self.worker.finished_state.connect(self._on_analyzed)
         self.worker.failed.connect(self._on_failed)
         self.worker.start()
+
+    def _confirm_fullres_ram(self) -> bool:
+        """Warn before a full-res LOCAL run on a low-RAM machine.
+
+        Returns True if analysis should proceed (possibly after switching to
+        fast mode via the dialog), False if the user cancelled.
+        """
+        from ..segmentation.system_probe import fullres_ram_warning
+        warning = fullres_ram_warning()
+        if warning is None:
+            return True
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle("Low memory for full-resolution")
+        box.setText("Full-resolution local segmentation may crash on this computer")
+        box.setInformativeText(warning)
+        use_fast = box.addButton("Use fast (3 mm) instead",
+                                 QtWidgets.QMessageBox.AcceptRole)
+        anyway = box.addButton("Run full-res anyway",
+                               QtWidgets.QMessageBox.DestructiveRole)
+        box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(use_fast)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is use_fast:
+            # switch the selector to fast (index 1) and proceed
+            self.res_combo.setCurrentIndex(1)
+            return True
+        if clicked is anyway:
+            return True
+        return False
 
     def _on_progress(self, msg, frac):
         if frac is None or frac < 0:          # indeterminate / busy
