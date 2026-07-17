@@ -23,6 +23,22 @@ if [[ ! -d "$APP" ]]; then
     --distpath "$DIST" --workpath "$ROOT/packaging/build"
 fi
 
+# 1b. FULL OFFLINE build: copy the prebuilt local-seg runtime + weights into the
+# .app so segmentation runs locally with zero setup. Skipped (lean cloud build)
+# when the bundle dir is absent. Build it first with build_localseg_env.py.
+BUNDLE_DIR="${SPINE_HU_LOCALSEG_BUNDLE:-$ROOT/packaging/localseg-bundle}"
+if [[ -d "$BUNDLE_DIR/localseg-env" ]]; then
+  echo "==> Bundling local-seg runtime from $BUNDLE_DIR"
+  python "$ROOT/packaging/bundle_localseg.py" --bundle "$BUNDLE_DIR" --app "$APP"
+  # Adhoc-sign so the freshly-copied nested binaries launch on unsigned builds
+  # (an existing signature over the .app is invalidated by adding files).
+  echo "==> Adhoc-signing the .app (unsigned distribution)"
+  codesign --force --deep --sign - "$APP" || \
+    echo "WARN: adhoc codesign failed (continuing)"
+else
+  echo "==> No local-seg bundle at $BUNDLE_DIR; building LEAN (cloud) app"
+fi
+
 rm -f "$DMG"
 
 if command -v create-dmg >/dev/null 2>&1; then
