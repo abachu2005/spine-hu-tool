@@ -21,6 +21,10 @@ jobs:
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
       APPLE_ID: ${{ secrets.APPLE_ID }}
       WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+      # Full offline build: the per-OS packagers copy this prebuilt local-seg
+      # runtime (env + weights) into the app so segmentation runs offline with
+      # zero setup. Empty -> lean cloud-only build.
+      SPINE_HU_LOCALSEG_BUNDLE: ${{ github.workspace }}/packaging/localseg-bundle
     strategy:
       fail-fast: false
       matrix:
@@ -51,11 +55,34 @@ jobs:
         shell: bash
         run: python packaging/make_icons.py
 
+      # Build the self-contained torch + TotalSegmentator runtime + weights that
+      # the offline installer ships. Heavy (multi-GB); does NOT run inference.
+      # Free up disk first so the weights fit on the runner.
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
+          df -h || true
+
+      - name: Build local-seg runtime + weights
+        shell: bash
+        run: |
+          python packaging/build_localseg_env.py --out packaging/localseg-bundle
+          du -sh packaging/localseg-bundle || true
+
       - name: Build app bundle (PyInstaller)
         shell: bash
         run: |
           pyinstaller packaging/spine_hu.spec --noconfirm \
             --distpath packaging/dist --workpath packaging/build
+
+      # Windows: the mac/linux packager scripts copy the runtime themselves, but
+      # the Windows path runs Inno Setup directly, so bundle here (before iscc).
+      - name: Bundle local-seg runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python packaging/bundle_localseg.py --app "packaging/dist/Spine HU Tool"
 
       # ---- macOS: optional signing, then .dmg ---------------------------
       # Signing runs only when the cert secret is configured (see
@@ -166,7 +193,12 @@ jobs:
         with:
           path: dist
 
+      # The offline installers bundle the ML runtime + weights and can exceed
+      # GitHub's 2 GB/file release-asset limit. GCS (publish-gcs below) is the
+      # authoritative labmate-facing channel, so don't fail the run if an asset
+      # is too large for a GitHub Release.
       - name: Publish release
+        continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:
           files: dist/**/*
@@ -174,12 +206,14 @@ jobs:
           body: |
             ## Spine HU Tool — desktop installers
 
-            Download the installer for your OS:
+            Download the installer for your OS from the download page (large
+            files are hosted there, not attached here):
             - **macOS**: `SpineHUTool-macos.dmg` (open, drag to Applications)
             - **Windows**: `SpineHUTool-windows-setup.exe` (setup wizard)
             - **Linux**: `SpineHUTool-linux-x86_64.AppImage` (mark executable, run)
 
-            Segmentation runs on the hosted cloud service. **Pilot / non-PHI use only.**
+            Segmentation runs fully offline on your computer (no upload needed);
+            a cloud option is also available. **Pilot / non-PHI use only.**
 
   # Publish the installers + download page to the public GCS bucket. This is the
   # labmate-facing download path (no GitHub login needed, repo stays private).

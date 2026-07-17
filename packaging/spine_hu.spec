@@ -121,8 +121,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": APP_NAME,
             "CFBundleDisplayName": APP_NAME,
-            "CFBundleShortVersionString": "0.1.0",
-            "CFBundleVersion": "0.1.0",
+            "CFBundleShortVersionString": "0.2.0",
+            "CFBundleVersion": "0.2.0",
             "NSHighResolutionCapable": True,
             "NSHumanReadableCopyright": "Pilot / research use only.",
         },
