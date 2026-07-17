@@ -35,6 +35,39 @@ _IS_WIN = sys.platform.startswith("win")
 # wheels (uv downloads a standalone build of it -- no system Python needed).
 _MANAGED_PY = "3.11"
 
+# Env vars PyInstaller injects into the frozen process so the dynamic loader and
+# Python point at the bundled runtime. If these leak into a child process (our
+# bundled / managed Python + TotalSegmentator) the child loads the frozen app's
+# libraries instead of its own -- the classic "runs from source but the packaged
+# app's local segmentation silently fails / crashes" bug. PyInstaller stashes the
+# pre-launch values in ``<VAR>_ORIG``; restore those when present, else drop the
+# variable entirely so the child gets a clean, self-contained environment.
+_LEAKY_ENV_VARS = (
+    "LD_LIBRARY_PATH", "LD_PRELOAD",
+    "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DYLD_INSERT_LIBRARIES",
+    "PYTHONHOME", "PYTHONPATH",
+)
+
+
+def child_env(extra: Optional[dict] = None) -> dict:
+    """A clean environment for launching the bundled/managed Python or TS.
+
+    Strips PyInstaller's injected loader/Python vars (restoring the originals it
+    saved in ``<VAR>_ORIG`` when available), so the child never inherits the
+    frozen app's bundled libraries. ``extra`` values are applied last; ``None``
+    values in ``extra`` are ignored.
+    """
+    env = dict(os.environ)
+    for var in _LEAKY_ENV_VARS:
+        orig = env.pop(var + "_ORIG", None)
+        if orig:
+            env[var] = orig
+        else:
+            env.pop(var, None)
+    if extra:
+        env.update({k: v for k, v in extra.items() if v is not None})
+    return env
+
 
 def _user_data_root() -> str:
     """OS-appropriate per-user data dir for app-managed files."""
@@ -74,6 +107,97 @@ def managed_ts_binary() -> Optional[str]:
     return cand if os.path.exists(cand) else None
 
 
+# --- bundled runtime (shipped inside the installer) ---------------------------
+#
+# The full offline build ships a prebuilt segmentation env and pretrained model
+# weights *inside* the app so local segmentation works with zero setup. These
+# live next to the frozen app; the exact directory depends on how PyInstaller
+# lays out the bundle per OS, so probe a list of candidates rather than assume
+# one path. Env var overrides let the build/tests point at an arbitrary path.
+
+def _bundle_roots() -> list:
+    """Candidate directories that may contain the bundled runtime/weights."""
+    roots: list = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(meipass)
+        # macOS .app BUNDLE: data lands in Contents/Frameworks while _MEIPASS may
+        # be Contents/Frameworks or Contents/MacOS; the app icon/resources sit in
+        # Contents/Resources. Cover the siblings.
+        parent = os.path.dirname(meipass)
+        roots.append(os.path.join(parent, "Resources"))
+        roots.append(parent)
+    exe_dir = os.path.dirname(sys.executable)
+    roots.append(exe_dir)
+    roots.append(os.path.join(exe_dir, "_internal"))
+    # macOS: Contents/MacOS/<exe> -> Contents/Resources
+    roots.append(os.path.join(exe_dir, "..", "Resources"))
+    # de-dupe while preserving order
+    seen = set()
+    out = []
+    for r in roots:
+        ap = os.path.abspath(r)
+        if ap not in seen:
+            seen.add(ap)
+            out.append(ap)
+    return out
+
+
+def bundled_env_dir() -> Optional[str]:
+    """Directory of the runtime bundled with the installer, or None.
+
+    Overridable with ``SPINE_HU_BUNDLED_ENV`` (used by the build/verify script).
+    """
+    override = os.environ.get("SPINE_HU_BUNDLED_ENV")
+    if override:
+        return override if os.path.isdir(override) else None
+    for root in _bundle_roots():
+        cand = os.path.join(root, "localseg-env")
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
+def bundled_ts_binary() -> Optional[str]:
+    """Path to the bundled TotalSegmentator console script, or None."""
+    env_dir = bundled_env_dir()
+    if env_dir is None:
+        return None
+    cand = os.path.join(_venv_bin_dir(env_dir), _exe("TotalSegmentator"))
+    return cand if os.path.exists(cand) else None
+
+
+def bundled_weights_dir() -> Optional[str]:
+    """Directory of the pretrained weights bundled with the installer, or None.
+
+    Overridable with ``SPINE_HU_BUNDLED_WEIGHTS``.
+    """
+    override = os.environ.get("SPINE_HU_BUNDLED_WEIGHTS")
+    if override:
+        return override if os.path.isdir(override) else None
+    for root in _bundle_roots():
+        cand = os.path.join(root, "totalseg-weights")
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
+def weights_home() -> Optional[str]:
+    """Weights directory to expose to TotalSegmentator (``TOTALSEG_HOME_DIR``).
+
+    Prefer an explicit override, then the bundled weights, then the managed
+    env's own weights dir if it exists. ``None`` means "let TotalSegmentator use
+    its default" (which downloads on first use).
+    """
+    override = os.environ.get("SPINE_HU_WEIGHTS_HOME")
+    if override:
+        return override
+    bundled = bundled_weights_dir()
+    if bundled:
+        return bundled
+    return None
+
+
 def is_ready() -> bool:
     """True if the managed local-segmentation runtime is fully installed."""
     py = managed_python()
@@ -82,7 +206,7 @@ def is_ready() -> bool:
     try:
         r = subprocess.run([py, "-c", "import torch, totalsegmentator"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=180)
+                           timeout=180, env=child_env())
         return r.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
@@ -151,8 +275,11 @@ def _run(cmd, progress: ProgressCb, label: str, env=None) -> None:
     """Run a subprocess, streaming its output line-by-line to `progress`."""
     if progress:
         progress(label)
+    # Always launch with a sanitized environment so a frozen host app's bundled
+    # loader/Python vars never leak into uv / the managed Python.
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, env=env)
+                            stderr=subprocess.STDOUT, text=True,
+                            env=env or child_env())
     last = ""
     for line in proc.stdout:                       # stream so the UI stays live
         last = line.strip()
