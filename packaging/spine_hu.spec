@@ -53,8 +53,11 @@ hiddenimports += [
     "PySide6.QtPrintSupport",
 ]
 
-# Keep the bundle lean: segmentation is offloaded to the cloud, so the giant
-# ML stack must never be pulled in.
+# Keep the frozen interpreter lean: the heavy ML stack must never be pulled into
+# the frozen app. In the FULL OFFLINE build it instead lives in a *sibling*
+# prebuilt environment (packaging/build_localseg_env.py) copied next to the app
+# after PyInstaller by packaging/bundle_localseg.py, and run as a subprocess.
+# In the LEAN build it is absent and segmentation runs on the cloud.
 excludes = [
     "torch", "torchvision", "totalsegmentator", "nnunetv2", "nnunet",
     "tensorflow", "tkinter", "PyQt5", "PyQt6", "IPython", "jupyter",
