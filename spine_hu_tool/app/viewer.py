@@ -209,10 +209,13 @@ class MainWindow(QtWidgets.QMainWindow):
         box.setInformativeText(
             "This tool is for pilot and research use only and is NOT a "
             "validated diagnostic device.\n\n"
-            "Segmentation runs on a shared, unauthenticated cloud service: "
+            "By default, segmentation runs on a shared cloud service: the "
             "scans you open are uploaded to that hosted service for "
-            "processing. Do NOT upload protected health information (PHI) — "
-            "use de-identified data only.\n\n"
+            "processing. When using the cloud, do NOT upload protected health "
+            "information (PHI) — use de-identified data only.\n\n"
+            "To keep scans on this computer, check \u201cRun segmentation on "
+            "this computer (no upload)\u201d on the next screen — nothing "
+            "leaves your machine in that mode.\n\n"
             "By continuing you confirm you understand and accept these terms.")
         agree = box.addButton("I understand and accept", QtWidgets.QMessageBox.AcceptRole)
         box.addButton("Quit", QtWidgets.QMessageBox.RejectRole)
@@ -260,8 +263,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.local_seg_cb = QtWidgets.QCheckBox(
             "Run segmentation on this computer (no upload)")
         self.local_seg_cb.setToolTip(
-            "Process the scan locally with TotalSegmentator instead of the cloud "
-            "service. Needs more RAM/CPU; set it up once with the button below.")
+            "Process the scan locally instead of the cloud service, so nothing "
+            "is uploaded. The offline build has everything it needs built in; "
+            "otherwise use \u201cSet up local segmentation\u201d once. Full-res "
+            "needs more RAM \u2014 pick Fast on a low-memory machine.")
         self.local_seg_cb.toggled.connect(self._on_local_toggled)
         # Segmentation resolution: full-res (1.5 mm, matches cloud, best ROI
         # placement) vs fast (3 mm, much lighter on RAM). Full-res is the
