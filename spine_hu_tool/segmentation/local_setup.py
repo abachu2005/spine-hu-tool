@@ -290,25 +290,36 @@ def _run(cmd, progress: ProgressCb, label: str, env=None) -> None:
         raise RuntimeError(f"{label} failed:\n{last}")
 
 
-def setup_local_seg(progress: ProgressCb = None) -> str:
-    """Provision the managed env and install the local segmentation stack.
+def _venv_python(env_dir: str) -> Optional[str]:
+    cand = os.path.join(_venv_bin_dir(env_dir), _exe("python"))
+    return cand if os.path.exists(cand) else None
 
-    Self-contained: bootstraps `uv`, which downloads a standalone Python, then
-    installs a CPU PyTorch + TotalSegmentator and pre-downloads the model
-    weights. Returns the managed TotalSegmentator binary path. Safe to re-run.
+
+def _venv_ts_binary(env_dir: str) -> Optional[str]:
+    cand = os.path.join(_venv_bin_dir(env_dir), _exe("TotalSegmentator"))
+    return cand if os.path.exists(cand) else None
+
+
+def provision_env(env_dir: str, *, weights_dir: Optional[str] = None,
+                  weight_tasks=("total_fast",), progress: ProgressCb = None,
+                  weights_fatal: bool = False) -> str:
+    """Install a self-contained torch + TotalSegmentator env into ``env_dir``.
+
+    Shared by the on-demand user install (:func:`setup_local_seg`) and the
+    packaging build script. Bootstraps ``uv`` (which downloads a standalone
+    CPython -- no system Python needed), installs CPU PyTorch + TotalSegmentator,
+    and pre-downloads the given weight ``weight_tasks``. When ``weights_dir`` is
+    given, weights are downloaded there (via ``TOTALSEG_HOME_DIR``) so they can
+    be bundled separately from the env. Returns the TotalSegmentator binary path.
+
+    ``weights_fatal`` makes a failed weight download raise (used by the build so
+    an installer never ships without weights); the on-demand path treats it as
+    best-effort since weights otherwise download on first use.
     """
-    if is_ready():
-        if progress:
-            progress("Local segmentation already installed.")
-        return managed_ts_binary()  # type: ignore[return-value]
-
-    env_dir = managed_env_dir()
-    os.makedirs(os.path.dirname(env_dir), exist_ok=True)
+    os.makedirs(os.path.dirname(env_dir) or ".", exist_ok=True)
     uv = _ensure_uv(progress)
 
-    # uv downloads a standalone CPython if the pinned version isn't present, so
-    # this works even with no Python installed on the machine.
-    if managed_python() is None:
+    if _venv_python(env_dir) is None:
         # `only-managed` forces uv to use a standalone CPython it downloads,
         # rather than any (possibly incompatible / transient) system Python --
         # this is what makes the install reproducible on a machine with no
@@ -316,7 +327,7 @@ def setup_local_seg(progress: ProgressCb = None) -> str:
         _run([uv, "venv", env_dir, "--python", _MANAGED_PY,
               "--python-preference", "only-managed"], progress,
              "Creating local Python environment...")
-    py = managed_python()
+    py = _venv_python(env_dir)
     if py is None:
         raise RuntimeError("Failed to create the local environment.")
 
@@ -336,20 +347,45 @@ def setup_local_seg(progress: ProgressCb = None) -> str:
     _uv_pip_install(["TotalSegmentator"], "Installing TotalSegmentator...")
 
     # Pre-download model weights so the first real run works offline. The console
-    # script ships with TotalSegmentator; treat failure as non-fatal (weights
-    # otherwise download on first use).
+    # script ships with TotalSegmentator.
     dl = os.path.join(_venv_bin_dir(env_dir), _exe("totalseg_download_weights"))
     if os.path.exists(dl):
-        try:
-            _run([dl, "-t", "total_fast"], progress,
-                 "Downloading segmentation model weights...")
-        except RuntimeError:
-            if progress:
-                progress("Weight pre-download skipped; will download on first run.")
+        dl_env = child_env({"TOTALSEG_HOME_DIR": weights_dir,
+                            "TOTALSEG_WEIGHTS_PATH": weights_dir})
+        if weights_dir:
+            os.makedirs(weights_dir, exist_ok=True)
+        for task in weight_tasks:
+            try:
+                _run([dl, "-t", task], progress,
+                     f"Downloading segmentation model weights ({task})...",
+                     env=dl_env)
+            except RuntimeError:
+                if weights_fatal:
+                    raise
+                if progress:
+                    progress(f"Weight pre-download ({task}) skipped; will "
+                             "download on first run.")
 
-    if progress:
-        progress("Local segmentation is ready.")
-    ts = managed_ts_binary()
+    ts = _venv_ts_binary(env_dir)
     if ts is None:
         raise RuntimeError("Install completed but TotalSegmentator was not found.")
+    return ts
+
+
+def setup_local_seg(progress: ProgressCb = None) -> str:
+    """Provision the managed env and install the local segmentation stack.
+
+    Self-contained: bootstraps `uv`, which downloads a standalone Python, then
+    installs a CPU PyTorch + TotalSegmentator and pre-downloads the model
+    weights. Returns the managed TotalSegmentator binary path. Safe to re-run.
+    """
+    if is_ready():
+        if progress:
+            progress("Local segmentation already installed.")
+        return managed_ts_binary()  # type: ignore[return-value]
+
+    ts = provision_env(managed_env_dir(), weight_tasks=("total_fast",),
+                       progress=progress)
+    if progress:
+        progress("Local segmentation is ready.")
     return ts
