@@ -53,8 +53,23 @@ def _user_cache_root() -> str:
     return os.path.join(os.path.expanduser("~"), ".cache")
 
 
+def safe_name_for_uid(series_uid: str) -> str:
+    """Stable cache key for a series UID (shared by analysis + run reopen)."""
+    return hashlib.sha1(series_uid.encode()).hexdigest()[:12]
+
+
 def _safe_name(series: SeriesInfo) -> str:
-    return hashlib.sha1(series.series_uid.encode()).hexdigest()[:12]
+    return safe_name_for_uid(series.series_uid)
+
+
+def cached_seg_path(series_uid: str) -> str:
+    """Path to the on-disk cached segmentation for a series (may not exist)."""
+    return os.path.join(_seg_cache_dir(), f"{safe_name_for_uid(series_uid)}_seg.nii.gz")
+
+
+def audit_path_for(series_uid: str) -> str:
+    """Path to the append-only review audit log for a series."""
+    return os.path.join(_seg_cache_dir(), f"{safe_name_for_uid(series_uid)}_audit.json")
 
 
 def _migrate_legacy_cache(folder: str, name: str, cache: str) -> None:
