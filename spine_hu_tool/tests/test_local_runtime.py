@@ -8,7 +8,6 @@ import os
 import sys
 
 import numpy as np
-import pytest
 
 from spine_hu_tool.core import Volume
 from spine_hu_tool.segmentation import local_setup as ls
