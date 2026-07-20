@@ -39,6 +39,45 @@ def _progress(msg: str) -> None:
     print(f"[build-localseg] {msg}", flush=True)
 
 
+def _slim_env(env_dir: str) -> None:
+    """Trim bundle bloat and, critically, the deeply-nested vendored license
+    trees that overflow Windows' 260-char MAX_PATH when the installer is built.
+
+    torch ships ``*.dist-info/licenses/third_party/.../LICENSE`` paths hundreds
+    of characters deep; Inno Setup can't read them on Windows ("The system
+    cannot find the path specified"). We drop those nested ``third_party``
+    license subtrees (torch's own top-level LICENSE stays) plus ``__pycache__``
+    and stray ``.pyc`` files. This does not touch importable code, so the
+    runtime is unaffected -- it just makes the tree shallower and smaller.
+    """
+    import shutil
+
+    removed = {"licenses": 0, "pycache": 0}
+    for root, dirs, files in os.walk(env_dir, topdown=True):
+        base = os.path.basename(root)
+        # prune nested vendored license trees inside any *.dist-info/licenses
+        if base == "third_party" and f"licenses{os.sep}" in (root + os.sep):
+            parent = os.path.dirname(root)
+            if ".dist-info" in parent or parent.endswith("licenses"):
+                shutil.rmtree(root, ignore_errors=True)
+                removed["licenses"] += 1
+                dirs[:] = []
+                continue
+        if base == "__pycache__":
+            shutil.rmtree(root, ignore_errors=True)
+            removed["pycache"] += 1
+            dirs[:] = []
+            continue
+        for f in files:
+            if f.endswith((".pyc", ".pyo")):
+                try:
+                    os.remove(os.path.join(root, f))
+                except OSError:
+                    pass
+    _progress(f"Slimmed env: removed {removed['licenses']} nested license "
+              f"tree(s), {removed['pycache']} __pycache__ dir(s).")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", default="packaging/localseg-bundle",
@@ -62,6 +101,7 @@ def main(argv=None) -> int:
     ts = provision_env(env_dir, weights_dir=weights_dir,
                        weight_tasks=tuple(args.tasks), progress=_progress,
                        weights_fatal=not args.best_effort_weights)
+    _slim_env(env_dir)
     _progress(f"Done. TotalSegmentator: {ts}")
 
     # Sanity: weights dir must be non-empty when weights are required.
