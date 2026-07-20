@@ -16,6 +16,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .review_state import ReviewState
 from .analysis import analyze_dataset
+from . import run_store
 from ..roi.modes import DEFAULT_MODE, EXPOSED_MODES, MODE_LABELS
 from ..segmentation.backends import resolve_seg_url
 from ..segmentation.totalseg_runner import local_seg_available
@@ -160,6 +161,66 @@ class AnalyzeWorker(QtCore.QThread):
             self.failed.emit(str(e))
 
 
+class BatchWorker(QtCore.QThread):
+    """Analyze several studies sequentially, saving each into the run library.
+
+    Runs off the UI thread. Each study is analyzed independently so one failure
+    (e.g. an unreadable study) does not abort the batch -- it is recorded as a
+    failed run and the batch continues. Emits per-study completion and a final
+    batch id.
+    """
+    progress = QtCore.Signal(str, float)
+    study_done = QtCore.Signal(str, str, str)     # run_id, label, status
+    finished_batch = QtCore.Signal(str)           # batch_id
+    failed = QtCore.Signal(str)
+
+    def __init__(self, folder, studies, mode, reviewer="physician",
+                 seg_url=None, local=False, fast=None):
+        super().__init__()
+        self.folder, self.studies, self.mode, self.reviewer = folder, studies, mode, reviewer
+        self.seg_url, self.local, self.fast = seg_url, local, fast
+        self.batch_id = run_store.new_batch_id()
+        self._backend = "local" if local else "cloud"
+        self._resolution = "fast" if fast else "full"
+
+    def run(self):
+        try:
+            run_ids = []
+            n = len(self.studies)
+            for i, study in enumerate(self.studies):
+                label = study.best_series.study_description or study.patient_label
+                meta = study.as_meta()
+                self.progress.emit(f"Analyzing study {i + 1} of {n}: {label}", i / max(1, n))
+                try:
+                    state = analyze_dataset(
+                        self.folder, series=study.best_series, mode=self.mode,
+                        only_clean=True, reviewer=self.reviewer,
+                        seg_url=self.seg_url, local=self.local, fast=self.fast)
+                    rec = run_store.build_record(
+                        state, meta, backend=self._backend,
+                        resolution=self._resolution, mode=self.mode,
+                        reviewer=self.reviewer, batch_id=self.batch_id,
+                        status="ready")
+                    run_store.save_run(rec)
+                    run_ids.append(rec["id"])
+                    self.study_done.emit(rec["id"], label, "ready")
+                except Exception as e:  # one bad study must not kill the batch
+                    rec = run_store.failed_record(
+                        meta, str(e), backend=self._backend,
+                        resolution=self._resolution, mode=self.mode,
+                        batch_id=self.batch_id)
+                    run_store.save_run(rec)
+                    run_ids.append(rec["id"])
+                    self.study_done.emit(rec["id"], label, "failed")
+            batch = run_store.new_batch(run_ids, source_folder=self.folder)
+            batch["id"] = self.batch_id
+            run_store.save_batch(batch)
+            self.progress.emit("Batch complete.", 1.0)
+            self.finished_batch.emit(self.batch_id)
+        except Exception as e:  # unexpected: surface it
+            self.failed.emit(str(e))
+
+
 class SetupWorker(QtCore.QThread):
     """Installs the local-segmentation runtime (torch + TotalSegmentator +
     weights) off the UI thread, streaming progress lines."""
@@ -186,6 +247,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.folder = None
         self.series = None
         self.current_level = None
+        self._studies = []            # StudyRecord list for the opened folder
+        self.current_run_id = None    # run library id of the run under review
+        self._grid_context = None     # None | ("past", None) | ("batch", batch_id)
         # display state
         self.wc, self.ww = 400.0, 1500.0
         self.show_body = True
@@ -231,6 +295,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(self.stack)
         self.stack.addWidget(self._landing_page())   # 0
         self.stack.addWidget(self._review_page())     # 1
+        self.stack.addWidget(self._results_page())    # 2 (batch complete / past runs)
         # Cmd+Z / Ctrl+Z reverts the last ROI edit (move, resize, recompute,
         # accept/reject); each gesture is a single undo step.
         self._undo_sc = QtGui.QShortcut(QtGui.QKeySequence.Undo, self)
@@ -252,6 +317,9 @@ class MainWindow(QtWidgets.QMainWindow):
         sub.setAlignment(QtCore.Qt.AlignCenter); sub.setStyleSheet("color:#9a9aa2;")
         btn = QtWidgets.QPushButton("Open DICOM folder...")
         btn.setFixedWidth(260); btn.clicked.connect(self.open_folder)
+        self.past_runs_btn = QtWidgets.QPushButton("View past runs...")
+        self.past_runs_btn.setFixedWidth(260)
+        self.past_runs_btn.clicked.connect(self.open_past_runs)
         # Segmentation runs on Cloud Run by default (prefilled); the heavy ML
         # step never touches this machine unless the field is explicitly cleared.
         self.seg_url_edit = QtWidgets.QLineEdit(resolve_seg_url(None) or "")
@@ -284,18 +352,27 @@ class MainWindow(QtWidgets.QMainWindow):
         for label, key in EXPOSED_MODES.items():
             self.roi_mode_combo.addItem(label, key)
         self.roi_mode_combo.setCurrentText(MODE_LABELS.get(DEFAULT_MODE, "centroid"))
-        self.series_combo = QtWidgets.QComboBox(); self.series_combo.setFixedWidth(420)
-        self.series_combo.setVisible(False)
-        self.analyze_btn = QtWidgets.QPushButton("Analyze")
+        # Multi-select study chooser: one checkable row per study so several
+        # studies (or all of them) can be batch-processed in one go.
+        self.select_all_cb = QtWidgets.QCheckBox("Select all studies")
+        self.select_all_cb.setFixedWidth(420)
+        self.select_all_cb.setVisible(False)
+        self.select_all_cb.toggled.connect(self._on_select_all)
+        self.study_list = QtWidgets.QListWidget(); self.study_list.setFixedWidth(420)
+        self.study_list.setFixedHeight(150)
+        self.study_list.setVisible(False)
+        self.study_list.itemChanged.connect(self._on_study_item_changed)
+        self.analyze_btn = QtWidgets.QPushButton("Analyze selected")
         self.analyze_btn.setFixedWidth(260); self.analyze_btn.setVisible(False)
         self.analyze_btn.clicked.connect(self.start_analyze)
         self.progress = QtWidgets.QProgressBar(); self.progress.setFixedWidth(420)
         self.progress.setVisible(False)
         self.status_lbl = QtWidgets.QLabel(""); self.status_lbl.setAlignment(QtCore.Qt.AlignCenter)
-        for widget in (title, sub, btn, self.seg_url_edit, self.local_seg_cb,
-                       self.res_combo, self.setup_local_btn, self.roi_mode_combo,
-                       self.series_combo, self.analyze_btn, self.progress,
-                       self.status_lbl):
+        self.status_lbl.setWordWrap(True)
+        for widget in (title, sub, btn, self.past_runs_btn, self.seg_url_edit,
+                       self.local_seg_cb, self.res_combo, self.setup_local_btn,
+                       self.roi_mode_combo, self.select_all_cb, self.study_list,
+                       self.analyze_btn, self.progress, self.status_lbl):
             v.addWidget(widget, alignment=QtCore.Qt.AlignHCenter)
         v.addStretch()
         return w
@@ -305,6 +382,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # left sidebar: levels + decision + export
         side = QtWidgets.QVBoxLayout()
+        self.back_btn = QtWidgets.QPushButton("\u2190 Back to results")
+        self.back_btn.clicked.connect(self._back_to_results)
+        self.back_btn.setVisible(False)
+        side.addWidget(self.back_btn)
         self.seg_banner = QtWidgets.QLabel("")
         self.seg_banner.setWordWrap(True)
         self.seg_banner.setVisible(False)
@@ -326,6 +407,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reject_btn = QtWidgets.QPushButton("Reject"); self.reject_btn.clicked.connect(lambda: self._decide(False))
         acc.addWidget(self.accept_btn); acc.addWidget(self.reject_btn)
         side.addLayout(acc)
+        self.finalize_btn = QtWidgets.QPushButton("Finalize (save review)")
+        self.finalize_btn.clicked.connect(self.finalize)
+        side.addWidget(self.finalize_btn)
         export_btn = QtWidgets.QPushButton("Export results..."); export_btn.clicked.connect(self.export)
         side.addWidget(export_btn)
         side.addStretch()
@@ -340,6 +424,135 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl = self._controls_box(); grid.addWidget(ctrl, 1, 1)
         cw = QtWidgets.QWidget(); cw.setLayout(grid); h.addWidget(cw, 1)
         return w
+
+    # ---- results / past-runs grid ---------------------------------------
+    def _results_page(self):
+        w = QtWidgets.QWidget(); v = QtWidgets.QVBoxLayout(w)
+        top = QtWidgets.QHBoxLayout()
+        self.results_back_btn = QtWidgets.QPushButton("\u2190 Back")
+        self.results_back_btn.setFixedWidth(120)
+        self.results_back_btn.clicked.connect(self._results_back)
+        top.addWidget(self.results_back_btn)
+        self.results_title = QtWidgets.QLabel("Results")
+        self.results_title.setObjectName("title")
+        top.addWidget(self.results_title); top.addStretch()
+        v.addLayout(top)
+
+        self.results_scroll = QtWidgets.QScrollArea()
+        self.results_scroll.setWidgetResizable(True)
+        self.results_inner = QtWidgets.QWidget()
+        self.results_vbox = QtWidgets.QVBoxLayout(self.results_inner)
+        self.results_vbox.setAlignment(QtCore.Qt.AlignTop)
+        self.results_scroll.setWidget(self.results_inner)
+        v.addWidget(self.results_scroll)
+        return w
+
+    def _clear_results_grid(self):
+        while self.results_vbox.count():
+            item = self.results_vbox.takeAt(0)
+            wdg = item.widget()
+            if wdg is not None:
+                wdg.deleteLater()
+
+    def _show_grid(self, entries, title, back):
+        """Render a list of cards. Each entry is a dict:
+        {"kind": "batch", "batch": <batch dict>} or
+        {"kind": "run", "run": <run dict>}."""
+        self.results_title.setText(title)
+        self._results_back_target = back
+        self._clear_results_grid()
+        if not entries:
+            self.results_vbox.addWidget(QtWidgets.QLabel("No runs yet."))
+        for entry in entries:
+            self.results_vbox.addWidget(self._make_card(entry))
+        self.stack.setCurrentIndex(2)
+
+    def _make_card(self, entry):
+        btn = QtWidgets.QPushButton()
+        btn.setStyleSheet("text-align:left; padding:12px;")
+        if entry["kind"] == "batch":
+            b = entry["batch"]
+            n = len(b.get("run_ids", []))
+            btn.setText(f"Batch \u00b7 {n} studies \u00b7 {b.get('created', '')}")
+            btn.clicked.connect(lambda _=False, bid=b["id"]: self.show_batch(bid))
+        else:
+            r = entry["run"]
+            st = r.get("study", {})
+            status = r.get("status", "ready")
+            label = (st.get("study_description") or st.get("patient_label")
+                     or st.get("series_uid", "study"))
+            date = st.get("study_date", "")
+            mark = {"ready": "", "reviewed": "  [reviewed]",
+                    "failed": "  [FAILED]"}.get(status, "")
+            btn.setText(f"{label}   {date}{mark}")
+            if status == "failed":
+                btn.setToolTip(r.get("error", "") or "analysis failed")
+                btn.setStyleSheet("text-align:left; padding:12px; color:#c5544a;")
+            btn.clicked.connect(lambda _=False, rid=r["id"]: self.open_run(rid))
+        return btn
+
+    def open_past_runs(self):
+        """Top-level history: batches and standalone single runs, newest first."""
+        self._grid_context = ("past", None)
+        self._reshow_current_grid()
+
+    def show_batch(self, batch_id):
+        self._grid_context = ("batch", batch_id)
+        self._reshow_current_grid()
+
+    def _reshow_current_grid(self):
+        """(Re)build the current grid from fresh store data so status changes
+        (e.g. a newly [reviewed] run) are reflected."""
+        ctx = getattr(self, "_grid_context", None)
+        if ctx is None:
+            self.stack.setCurrentIndex(0)
+            return
+        kind, arg = ctx
+        if kind == "batch":
+            try:
+                batch = run_store.load_batch(arg)
+            except (OSError, ValueError):
+                self.stack.setCurrentIndex(0)
+                return
+            runs = []
+            for rid in batch.get("run_ids", []):
+                try:
+                    runs.append(run_store.load_run(rid))
+                except (OSError, ValueError):
+                    continue
+            entries = [{"kind": "run", "run": r} for r in runs]
+            self._show_grid(entries, f"Batch \u00b7 {len(runs)} studies", back="past")
+        else:  # past runs
+            batches = run_store.list_batches()
+            runs = run_store.list_runs()
+            batched_ids = {rid for b in batches for rid in b.get("run_ids", [])}
+            entries = [{"kind": "batch", "batch": b, "created": b.get("created", "")}
+                       for b in batches]
+            entries += [{"kind": "run", "run": r, "created": r.get("created", "")}
+                        for r in runs if r["id"] not in batched_ids]
+            entries.sort(key=lambda e: e.get("created", ""), reverse=True)
+            self._show_grid(entries, "Past runs", back="landing")
+
+    def open_run(self, run_id):
+        try:
+            state = run_store.reopen_run(run_id)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Cannot open run", str(e))
+            return
+        self.load_state(state, run_id=run_id)
+
+    def _results_back(self):
+        target = getattr(self, "_results_back_target", "landing")
+        if target == "past":
+            self.open_past_runs()
+        else:
+            self.stack.setCurrentIndex(0)
+
+    def _back_to_results(self):
+        if getattr(self, "_grid_context", None) is None:
+            self.stack.setCurrentIndex(0)
+            return
+        self._reshow_current_grid()
 
     def _controls_box(self):
         box = QtWidgets.QGroupBox("Display & ROI"); v = QtWidgets.QVBoxLayout(box)
@@ -383,44 +596,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_folder(folder)
 
     def _load_folder(self, folder):
-        """Series-select a folder and populate the chooser (no dialog -- testable).
+        """Discover studies in a folder and populate the multi-select chooser.
 
-        Handles folders that contain many patients/studies (the usual physician
-        upload): series are grouped under disabled patient/study headers and the
-        best axial CT is preselected.
+        Handles the realistic physician upload: a folder that may hold one study
+        or many patients/studies in arbitrarily nested layouts. One checkable row
+        per study is shown so any subset (or all) can be batch-processed; the
+        best study is checked by default. Returns the best series (testability /
+        backward compatibility).
         """
         self.folder = folder
-        from ..io.series_selector import select_ct_series, list_studies
-        best, cands = select_ct_series(folder)
-        self.series_combo.clear()
-        self._row_series = {}        # selectable combo row -> SeriesInfo
-        patients = list_studies(cands, axial_only=True)
-        model = self.series_combo.model()
-        best_row = None
-        multi_patient = len(patients) > 1
-        for plabel, studies in patients:
-            if multi_patient:                       # only show patient header when needed
-                self.series_combo.addItem(f"\u2014  {plabel}")
-                model.item(self.series_combo.count() - 1).setEnabled(False)
-            for s in studies:
-                self.series_combo.addItem(s.option_label)
-                row = self.series_combo.count() - 1
-                self._row_series[row] = s
-                if best is not None and s.series_uid == best.series_uid:
-                    best_row = row
-        if best_row is not None:
-            self.series_combo.setCurrentIndex(best_row)
-        self.series_combo.setVisible(True); self.analyze_btn.setVisible(True)
-        n_studies = len(self._row_series)
-        if best is not None:
+        from ..io.study_discovery import discover_studies
+        studies = discover_studies(folder, axial_only=True)
+        self._studies = studies
+
+        self.study_list.blockSignals(True)
+        self.study_list.clear()
+        n_patients = len({s.patient_id for s in studies})
+        for i, study in enumerate(studies):
+            prefix = (f"{study.patient_label}  \u2014  " if n_patients > 1 else "")
+            it = QtWidgets.QListWidgetItem(prefix + study.option_label)
+            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+            it.setData(QtCore.Qt.UserRole, i)
+            it.setCheckState(QtCore.Qt.Checked if i == 0 else QtCore.Qt.Unchecked)
+            self.study_list.addItem(it)
+        self.study_list.blockSignals(False)
+
+        has = bool(studies)
+        self.study_list.setVisible(has)
+        self.select_all_cb.setVisible(has)
+        self.analyze_btn.setVisible(has)
+        if has:
             self.status_lbl.setText(
-                f"{n_studies} study(ies) found across {len(patients)} patient(s). "
-                f"Selected: {best.study_description or best.description}")
-        elif n_studies:
-            self.status_lbl.setText("No clear axial CT auto-detected; pick a series manually.")
+                f"{len(studies)} study(ies) across {n_patients} patient(s). "
+                "Check the studies to analyze (or Select all), then Analyze.")
         else:
             self.status_lbl.setText("No DICOM CT series found in this folder.")
-        return best
+        # backward-compat mapping used by tests / single-study callers
+        self._row_series = {i: s.best_series for i, s in enumerate(studies)}
+        return studies[0].best_series if studies else None
+
+    def _on_select_all(self, checked):
+        state = QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked
+        self.study_list.blockSignals(True)
+        for i in range(self.study_list.count()):
+            self.study_list.item(i).setCheckState(state)
+        self.study_list.blockSignals(False)
+
+    def _on_study_item_changed(self, _item):
+        # keep the "Select all" box in sync without recursing
+        total = self.study_list.count()
+        checked = sum(1 for i in range(total)
+                      if self.study_list.item(i).checkState() == QtCore.Qt.Checked)
+        self.select_all_cb.blockSignals(True)
+        self.select_all_cb.setChecked(total > 0 and checked == total)
+        self.select_all_cb.blockSignals(False)
+
+    def _checked_studies(self):
+        out = []
+        for i in range(self.study_list.count()):
+            it = self.study_list.item(i)
+            if it.checkState() == QtCore.Qt.Checked:
+                idx = it.data(QtCore.Qt.UserRole)
+                if 0 <= idx < len(self._studies):
+                    out.append(self._studies[idx])
+        return out
 
     def _on_local_toggled(self, checked):
         # The server URL is irrelevant when segmenting locally; grey it out so the
@@ -470,13 +709,10 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.critical(self, "Local setup failed", msg)
 
     def start_analyze(self):
-        series = getattr(self, "_row_series", {}).get(self.series_combo.currentIndex())
-        if series is None:        # header/empty selection -> first available series
-            series = next(iter(getattr(self, "_row_series", {}).values()), None)
-        if series is None:
-            self.status_lbl.setText("No selectable CT series in this folder.")
+        studies = self._checked_studies()
+        if not studies:
+            self.status_lbl.setText("Check at least one study to analyze.")
             return
-        self.series = series
         local = self.local_seg_cb.isChecked()
         fast = bool(self.res_combo.currentData())
         # Guard a full-res LOCAL run on a machine that likely lacks the RAM: the
@@ -484,9 +720,22 @@ class MainWindow(QtWidgets.QMainWindow):
         # crash risk (and the warning) only applies then.
         if local and not fast and not self._confirm_fullres_ram():
             return
-        self.progress.setVisible(True); self.analyze_btn.setEnabled(False)
+        fast = bool(self.res_combo.currentData())   # may have changed in the dialog
         seg_url = self.seg_url_edit.text().strip() or None
         mode = self.roi_mode_combo.currentData() or DEFAULT_MODE
+        self.progress.setVisible(True); self.analyze_btn.setEnabled(False)
+
+        if len(studies) == 1:
+            self._start_single(studies[0], mode, seg_url, local, fast)
+        else:
+            self._start_batch(studies, mode, seg_url, local, fast)
+
+    def _start_single(self, study, mode, seg_url, local, fast):
+        self.series = study.best_series
+        self._pending_study = study
+        self._pending_backend = "local" if local else "cloud"
+        self._pending_resolution = "fast" if fast else "full"
+        self._pending_mode = mode
         self.worker = AnalyzeWorker(self.folder, self.series, mode,
                                     "physician", seg_url=seg_url, local=local,
                                     fast=fast)
@@ -494,6 +743,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.finished_state.connect(self._on_analyzed)
         self.worker.failed.connect(self._on_failed)
         self.worker.start()
+
+    def _start_batch(self, studies, mode, seg_url, local, fast):
+        self.progress.setRange(0, 0)
+        self.batch_worker = BatchWorker(self.folder, studies, mode,
+                                        seg_url=seg_url, local=local, fast=fast)
+        self.batch_worker.progress.connect(self._on_progress)
+        self.batch_worker.finished_batch.connect(self._on_batch_done)
+        self.batch_worker.failed.connect(self._on_failed)
+        self.batch_worker.start()
+
+    def _on_batch_done(self, batch_id):
+        self.analyze_btn.setEnabled(True)
+        self.progress.setVisible(False); self.progress.setRange(0, 100)
+        self.show_batch(batch_id)
 
     def _confirm_fullres_ram(self) -> bool:
         """Warn before a full-res LOCAL run on a low-RAM machine.
@@ -540,11 +803,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_analyzed(self, state):
         self.analyze_btn.setEnabled(True)
-        self.load_state(state)
+        self.progress.setVisible(False)
+        # Auto-save the single run into the library so it can be reopened later.
+        run_id = None
+        study = getattr(self, "_pending_study", None)
+        try:
+            meta = (study.as_meta() if study is not None
+                    else run_store.study_meta_from_series(self.series, self.folder))
+            rec = run_store.build_record(
+                state, meta,
+                backend=getattr(self, "_pending_backend", "cloud"),
+                resolution=getattr(self, "_pending_resolution", "full"),
+                mode=getattr(self, "_pending_mode", DEFAULT_MODE), status="ready")
+            run_store.save_run(rec)
+            run_id = rec["id"]
+        except Exception:
+            run_id = None            # persistence is best-effort; never block review
+        self._grid_context = None     # single run: "Back to results" not applicable
+        self.load_state(state, run_id=run_id)
 
-    def load_state(self, state: ReviewState):
+    def load_state(self, state: ReviewState, run_id=None):
         """Populate the review screen from a ReviewState (also used in tests)."""
         self.state = state
+        self.current_run_id = run_id
+        self.back_btn.setVisible(getattr(self, "_grid_context", None) is not None)
         seg_status = state.case.get("seg_status")
         if seg_status and seg_status != "ok":
             reasons = (state.case.get("seg_check") or {}).get("global_reasons", [])
@@ -817,6 +1099,34 @@ class MainWindow(QtWidgets.QMainWindow):
             f"radius {r.radius_mm:.1f} mm | clearance {r.margin_mm:.1f} mm<br>"
             f"volume {s.get('volume_mm3', 0):.0f} mm&sup3;<br>"
             f"<b>QC: {r.qc.get('qc_status')}</b><br>{ctx_line}{warns}")
+
+    def finalize(self):
+        """Mark the run reviewed: save the physician's edits + write the export
+        into the run library so it persists and shows as reviewed in past runs."""
+        if not self.state:
+            return
+        if not self.current_run_id:
+            QtWidgets.QMessageBox.information(
+                self, "Nothing to finalize",
+                "This view is not linked to a saved run.")
+            return
+        try:
+            rec = run_store.load_run(self.current_run_id)
+            rec["overrides"] = run_store.overrides_from_state(self.state)
+            rec["measurements"] = {lvl: r.summary()
+                                   for lvl, r in self.state.results.items()}
+            rec["status"] = "reviewed"
+            export_dir = os.path.join(run_store.run_dir(self.current_run_id), "export")
+            self._do_export(export_dir)
+            rec["export_dir"] = export_dir
+            run_store.save_run(rec)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Finalize failed", str(e))
+            return
+        QtWidgets.QMessageBox.information(
+            self, "Run finalized",
+            "Review saved. This study is marked reviewed and its results were "
+            "written to the run library.")
 
     def export(self):
         if not self.state:
