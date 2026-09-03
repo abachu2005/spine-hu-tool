@@ -15,7 +15,7 @@ requires-python = ">=3.10"
 # stays lean (hundreds of MB packaged instead of multiple GB).
 dependencies = [
     "numpy", "scipy", "nibabel", "pydicom", "SimpleITK", "matplotlib",
-    "PySide6", "pyqtgraph", "requests",
+    "PySide6", "pyqtgraph", "requests", "psutil",
 ]
 
 [project.optional-dependencies]

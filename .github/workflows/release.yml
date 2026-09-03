@@ -21,6 +21,11 @@ jobs:
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
       APPLE_ID: ${{ secrets.APPLE_ID }}
       WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+      # Full offline build: the per-OS packagers copy this prebuilt local-seg
+      # runtime (env + weights) into the app so segmentation runs offline with
+      # zero setup. Empty -> lean cloud-only build.
+      SPINE_HU_LOCALSEG_BUNDLE: ${{ github.workspace }}/packaging/localseg-bundle
     strategy:
       fail-fast: false
       matrix:
@@ -64,11 +69,34 @@ jobs:
         shell: bash
         run: python packaging/make_icons.py
 
+      # Build the self-contained torch + TotalSegmentator runtime + weights that
+      # the offline installer ships. Heavy (multi-GB); does NOT run inference.
+      # Free up disk first so the weights fit on the runner.
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
+          df -h || true
+
+      - name: Build local-seg runtime + weights
+        shell: bash
+        run: |
+          python packaging/build_localseg_env.py --out packaging/localseg-bundle
+          du -sh packaging/localseg-bundle || true
+
       - name: Build app bundle (PyInstaller)
         shell: bash
         run: |
           pyinstaller packaging/spine_hu.spec --noconfirm \
             --distpath packaging/dist --workpath packaging/build
+
+      # Windows: the mac/linux packager scripts copy the runtime themselves, but
+      # the Windows path runs Inno Setup directly, so bundle here (before iscc).
+      - name: Bundle local-seg runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python packaging/bundle_localseg.py --app "packaging/dist/Spine HU Tool"
 
       # ---- macOS: optional signing, then .dmg ---------------------------
       # Signing runs only when the cert secret is configured (see
@@ -132,6 +160,12 @@ jobs:
           $st = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1).FullName
           & $st sign /f "$env:RUNNER_TEMP\cert.pfx" /p $env:WINDOWS_CERT_PASSWORD /tr http://timestamp.digicert.com /td sha256 /fd sha256 "packaging\dist\Spine HU Tool\Spine HU Tool.exe"
 
+      - name: Enable long paths (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force | Out-Null
+
       - name: Build setup.exe (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -162,62 +196,11 @@ jobs:
           mkdir -p artifacts
           mv packaging/dist/SpineHUTool-x86_64.AppImage artifacts/SpineHUTool-linux-x86_64.AppImage
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: artifacts/*
-
-  release:
-    name: Publish GitHub Release
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    steps:
-      - name: Download all installers
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/**/*
-          generate_release_notes: true
-          body: |
-            ## Spine HU Tool — desktop installers
-
-            Download the installer for your OS:
-            - **macOS**: `SpineHUTool-macos.dmg` (open, drag to Applications)
-            - **Windows**: `SpineHUTool-windows-setup.exe` (setup wizard)
-            - **Linux**: `SpineHUTool-linux-x86_64.AppImage` (mark executable, run)
-
-            Segmentation runs on the hosted cloud service. **Pilot / non-PHI use only.**
-
-  # Publish the installers + download page to the public GCS bucket. This is the
-  # labmate-facing download path (no GitHub login needed, repo stays private).
-  publish-gcs:
-    name: Publish to GCS download page
-    needs: build
-    runs-on: ubuntu-latest
-    # Skip when the GCP secret isn't configured (e.g. on a fork).
-    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
-    env:
-      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-    steps:
-      - name: Skip if no GCP credentials
-        if: ${{ env.GCP_SA_KEY == '' }}
-        run: echo "GCP_SA_KEY not set; skipping GCS publish." && exit 0
-
-      - uses: actions/checkout@v4
-        if: ${{ env.GCP_SA_KEY != '' }}
-
-      - name: Download all installers
-        if: ${{ env.GCP_SA_KEY != '' }}
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-
+      # Publish this OS's installer straight to GCS. The offline installers are
+      # multi-GB -- far too large for GitHub's artifact storage (it hits the
+      # account quota) or a GitHub Release (2 GB/file limit) -- so each build job
+      # uploads its own file directly to the public bucket the download page
+      # serves. Skipped when GCP creds aren't configured (e.g. a fork).
       - name: Authenticate to Google Cloud
         if: ${{ env.GCP_SA_KEY != '' }}
         uses: google-github-actions/auth@v2
@@ -230,7 +213,7 @@ jobs:
         with:
           project_id: ${{ secrets.GCP_PROJECT }}
 
-      - name: Upload installers + download page
+      - name: Upload installer to GCS
         if: ${{ env.GCP_SA_KEY != '' }}
         shell: bash
         env:
@@ -238,32 +221,59 @@ jobs:
         run: |
           set -euo pipefail
           B="gs://$GCS_BUCKET"
-          # Per-release archive dir (tag name) when triggered by a tag.
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             VER="${GITHUB_REF_NAME}"
           else
             VER="manual-${GITHUB_RUN_NUMBER}"
           fi
-
-          declare -A MAP=(
-            ["dist/macos-dmg/SpineHUTool-macos.dmg"]="SpineHUTool-macos.dmg"
-            ["dist/windows-setup/SpineHUTool-windows-setup.exe"]="SpineHUTool-windows-setup.exe"
-            ["dist/linux-appimage/SpineHUTool-linux-x86_64.AppImage"]="SpineHUTool-linux-x86_64.AppImage"
-          )
-          for src in "${!MAP[@]}"; do
-            name="${MAP[$src]}"
-            if [[ -f "$src" ]]; then
-              echo "Uploading $name"
-              gcloud storage cp "$src" "$B/latest/$name" --cache-control="public, max-age=3600"
-              gcloud storage cp "$src" "$B/$VER/$name"   --cache-control="public, max-age=3600"
-            else
-              echo "WARN: missing $src (skipping)"
-            fi
+          shopt -s nullglob
+          for f in artifacts/*; do
+            name="$(basename "$f")"
+            echo "Uploading $name -> $B/{latest,$VER}/"
+            gcloud storage cp "$f" "$B/latest/$name" --cache-control="public, max-age=3600"
+            gcloud storage cp "$f" "$B/$VER/$name"   --cache-control="public, max-age=3600"
           done
 
-          # Download page + metadata (short cache so updates show immediately).
-          gcloud storage cp packaging/download/index.html   "$B/index.html"   --cache-control="no-cache"
-          gcloud storage cp packaging/download/version.json  "$B/version.json" --cache-control="no-cache"
-          gcloud storage cp packaging/icons/spine_hu.png     "$B/icon.png"     --cache-control="public, max-age=86400" || true
-
+      # The download page itself (small text/image files) is published once, from
+      # the Linux job, so a viewer always sees the current version + links.
+      - name: Publish download page (Linux)
+        if: ${{ runner.os == 'Linux' && env.GCP_SA_KEY != '' }}
+        shell: bash
+        env:
+          GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
+        run: |
+          set -euo pipefail
+          B="gs://$GCS_BUCKET"
+          gcloud storage cp packaging/download/index.html  "$B/index.html"  --cache-control="no-cache"
+          gcloud storage cp packaging/download/version.json "$B/version.json" --cache-control="no-cache"
+          gcloud storage cp packaging/icons/spine_hu.png    "$B/icon.png"    --cache-control="public, max-age=86400" || true
           echo "Published. Download page: https://storage.googleapis.com/$GCS_BUCKET/index.html"
+
+  # Lightweight GitHub Release for the changelog/tag record only. The installers
+  # live on GCS (too large for release assets), so no files are attached here.
+  release:
+    name: Publish GitHub Release (notes only)
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release notes
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## Spine HU Tool — desktop installers
+
+            Download the installer for your OS from the download page
+            (installers are hosted there, not attached here):
+            https://storage.googleapis.com/spine-hu-tool-downloads/index.html
+
+            - **macOS**: `SpineHUTool-macos.dmg` (open, drag to Applications)
+            - **Windows**: `SpineHUTool-windows-setup.exe` (setup wizard)
+            - **Linux**: `SpineHUTool-linux-x86_64.AppImage` (mark executable, run)
+
+            Segmentation runs fully offline on your computer (no upload needed);
+            a cloud option is also available. **Pilot / non-PHI use only.**

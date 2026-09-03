@@ -24,6 +24,17 @@ if [[ ! -d "$BUNDLE" ]]; then
     --distpath "$DIST" --workpath "$ROOT/packaging/build"
 fi
 
+# 1b. FULL OFFLINE build: copy the prebuilt local-seg runtime + weights next to
+# the executable so segmentation runs locally with zero setup. Skipped (lean
+# cloud build) when the bundle dir is absent.
+BUNDLE_DIR="${SPINE_HU_LOCALSEG_BUNDLE:-$ROOT/packaging/localseg-bundle}"
+if [[ -d "$BUNDLE_DIR/localseg-env" ]]; then
+  echo "==> Bundling local-seg runtime from $BUNDLE_DIR"
+  python "$ROOT/packaging/bundle_localseg.py" --bundle "$BUNDLE_DIR" --app "$BUNDLE"
+else
+  echo "==> No local-seg bundle at $BUNDLE_DIR; building LEAN (cloud) app"
+fi
+
 # 2. assemble the AppDir
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" \

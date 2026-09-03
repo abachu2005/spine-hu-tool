@@ -75,19 +75,30 @@ def load_segmentation(path: str) -> np.ndarray:
 def _ts_binary() -> Optional[str]:
     """Path to the TotalSegmentator console script, or None if not installed.
 
-    The packaged desktop client intentionally ships without TotalSegmentator
-    (segmentation is offloaded to the cloud), so this can legitimately be None.
+    Resolution order (first hit wins):
+      1. runtime bundled inside the installer (full offline build)
+      2. a TotalSegmentator installed next to this Python / on PATH (dev installs)
+      3. the app-managed local-seg env, installed on demand by the user
+
+    A lean cloud-only build has none of these, so this can legitimately be None.
     """
     import shutil
-    cand = os.path.join(os.path.dirname(sys.executable), "TotalSegmentator")
+    from .local_setup import bundled_ts_binary, managed_ts_binary
+
+    bundled = bundled_ts_binary()
+    if bundled:
+        return bundled
+    cand = os.path.join(os.path.dirname(sys.executable), _exe("TotalSegmentator"))
     if os.path.exists(cand):
         return cand
     on_path = shutil.which("TotalSegmentator")
     if on_path:
         return on_path
-    # The app-managed local-seg environment, installed on demand by the user.
-    from .local_setup import managed_ts_binary
     return managed_ts_binary()
+
+
+def _exe(name: str) -> str:
+    return name + ".exe" if sys.platform.startswith("win") else name
 
 
 def local_seg_available() -> bool:
@@ -116,10 +127,12 @@ def run_segmentation(volume: Volume, work_dir: str, name: str,
     if ts is None:
         raise RuntimeError(
             "Local segmentation is not available in this installation "
-            "(TotalSegmentator is not installed). This build segments on the "
-            "cloud service instead -- make sure a segmentation server URL is "
-            "configured (it is by default) and you are online. To enable local "
-            "segmentation, install the optional dependencies: "
+            "(TotalSegmentator is not installed). The full offline build ships "
+            "the segmentation runtime inside the app; this appears to be the "
+            "lean cloud build, which segments on the cloud service instead -- "
+            "make sure a segmentation server URL is configured (it is by "
+            "default) and you are online. To enable local segmentation from a "
+            "source checkout, install the optional dependencies: "
             "pip install 'spine-hu-tool[local-seg]'.")
 
     in_path = os.path.join(work_dir, f"{name}.nii.gz")
@@ -134,10 +147,23 @@ def run_segmentation(volume: Volume, work_dir: str, name: str,
             threads = max(1, int(env_threads))
         else:
             threads = max(1, (os.cpu_count() or 4) // 2)
-    env = dict(os.environ)
-    env.update(OMP_NUM_THREADS=str(threads), MKL_NUM_THREADS=str(threads),
-               OPENBLAS_NUM_THREADS=str(threads), VECLIB_MAXIMUM_THREADS=str(threads),
-               nnUNet_def_n_proc=str(threads))
+    # Build a sanitized child environment: a frozen host app injects loader/Python
+    # vars (DYLD_*/LD_*/PYTHONHOME/...) that would make the bundled Python load the
+    # wrong libraries. `child_env` strips those (restoring PyInstaller's saved
+    # originals when present).
+    from .local_setup import child_env, weights_home
+    thread_env = dict(
+        OMP_NUM_THREADS=str(threads), MKL_NUM_THREADS=str(threads),
+        OPENBLAS_NUM_THREADS=str(threads), VECLIB_MAXIMUM_THREADS=str(threads),
+        nnUNet_def_n_proc=str(threads))
+    # Point TotalSegmentator at the bundled weights so a first run works fully
+    # offline (no download). `weights_home()` is None for source/dev installs, in
+    # which case TotalSegmentator uses its own default location.
+    wh = weights_home()
+    if wh:
+        thread_env["TOTALSEG_HOME_DIR"] = wh
+        thread_env["TOTALSEG_WEIGHTS_PATH"] = wh
+    env = child_env(thread_env)
 
     # Device is configurable so the same code runs on a CPU or a GPU server
     # (set SPINE_HU_DEVICE=gpu on a GPU-backed deployment).
