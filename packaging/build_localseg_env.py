@@ -52,6 +52,29 @@ def _progress(msg: str) -> None:
     print(f"[build-localseg] {msg}", flush=True)
 
 
+def _make_relocatable(env_dir: str) -> None:
+    """Strip uv-store artifacts that would break or block the shipped runtime.
+
+    - uv creates a version-less ``cpython-3.11-<plat>`` alias as an ABSOLUTE
+      symlink to the real install: dangling after relocation -> remove.
+    - uv marks its pythons ``EXTERNALLY-MANAGED`` (PEP 668), which blocks
+      ensurepip/pip. This runtime is exclusively ours, so remove the marker.
+    - drop uv's store bookkeeping (.lock, .temp, .gitignore).
+    """
+    for entry in os.listdir(env_dir):
+        p = os.path.join(env_dir, entry)
+        if os.path.islink(p):
+            os.remove(p)
+        elif entry in (".lock", ".gitignore"):
+            os.remove(p)
+        elif entry == ".temp":
+            import shutil
+            shutil.rmtree(p, ignore_errors=True)
+    for root, _dirs, files in os.walk(env_dir):
+        if "EXTERNALLY-MANAGED" in files:
+            os.remove(os.path.join(root, "EXTERNALLY-MANAGED"))
+
+
 def provision_standalone_runtime(env_dir: str, *, weights_dir: str,
                                  weight_tasks=("total", "total_fast"),
                                  progress=None,
@@ -68,10 +91,12 @@ def provision_standalone_runtime(env_dir: str, *, weights_dir: str,
 
     # 1. Standalone CPython (python-build-standalone) extracted INTO the bundle.
     #    UV_PYTHON_INSTALL_DIR redirects uv's managed-python store to env_dir, so
-    #    the interpreter lands at <env_dir>/cpython-<ver>-<platform>/.
-    ls._run([uv, "python", "install", ls._MANAGED_PY], progress,
+    #    the interpreter lands at <env_dir>/cpython-<ver>-<platform>/. --no-bin
+    #    stops uv from also dropping shims into ~/.local/bin.
+    ls._run([uv, "python", "install", ls._MANAGED_PY, "--no-bin"], progress,
             "Installing standalone CPython into the bundle...",
             env=ls.child_env({"UV_PYTHON_INSTALL_DIR": env_dir}))
+    _make_relocatable(env_dir)
     py = ls.find_runtime_python(env_dir)
     if py is None:
         raise RuntimeError(f"No interpreter found under {env_dir} after "

@@ -192,9 +192,12 @@ def find_runtime_python(root: Optional[str]) -> Optional[str]:
         return None
     bases = [root]
     try:
+        # Skip symlinked cpython-* aliases: uv creates a version-less alias as
+        # an ABSOLUTE symlink, which dangles once the bundle is relocated.
         bases += sorted(os.path.join(root, d) for d in os.listdir(root)
                         if d.startswith("cpython-")
-                        and os.path.isdir(os.path.join(root, d)))
+                        and os.path.isdir(os.path.join(root, d))
+                        and not os.path.islink(os.path.join(root, d)))
     except OSError:
         return None
     for base in bases:
