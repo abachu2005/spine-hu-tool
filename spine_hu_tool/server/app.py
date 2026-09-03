@@ -5,6 +5,10 @@ Endpoints
   POST /upload-url        -> mint a V4 signed PUT URL so the client can upload a
                              large CT volume straight to GCS (bypasses Cloud
                              Run's 32 MiB request limit).
+  POST /runs/upload-url   -> mint a signed PUT URL for one file of an archived
+                             run (runs/<YYYY-MM>/<run_id>/<filename>); clients
+                             archive inputs/outputs/logs of every run for QA
+                             and remote troubleshooting.
   POST /segment-async     -> start segmentation of a GCS-resident volume in a
                              background thread; returns {job_id} immediately.
   GET  /segment-status/.. -> poll a job; when done, returns a signed GET URL to
@@ -31,6 +35,7 @@ client. This is the only component that needs real RAM/GPU.
 """
 from __future__ import annotations
 import os
+import re
 import uuid
 import shutil
 import datetime
@@ -136,6 +141,11 @@ class UploadUrlResponse(BaseModel):
     content_type: str
 
 
+class RunUploadUrlRequest(BaseModel):
+    run_id: str
+    filename: str
+
+
 class SegmentRequest(BaseModel):
     object_name: str
     fast: bool = True
@@ -162,6 +172,43 @@ def health():
 def upload_url(authorization: str | None = Header(default=None)):
     _check_auth(authorization)
     object_name = f"uploads/{uuid.uuid4().hex}.nii.gz"
+    content_type = "application/octet-stream"
+    return UploadUrlResponse(object_name=object_name,
+                             url=_signed_put_url(object_name, content_type),
+                             content_type=content_type)
+
+
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitize_component(value: str, *, max_len: int = 120) -> str:
+    """Collapse a client-supplied name to a safe single path component.
+
+    Strips path separators / traversal so a malicious or buggy client can only
+    ever write inside its own ``runs/<month>/<run_id>/`` prefix.
+    """
+    value = os.path.basename(value.replace("\\", "/")).strip()
+    value = _SAFE_NAME.sub("_", value).strip("._")
+    return value[:max_len]
+
+
+@app.post("/runs/upload-url", response_model=UploadUrlResponse)
+def runs_upload_url(body: RunUploadUrlRequest,
+                    authorization: str | None = Header(default=None)):
+    """Mint a signed PUT URL for one file of an archived run.
+
+    Every client run (local or cloud segmentation) archives its inputs,
+    outputs, and logs under ``runs/<YYYY-MM>/<run_id>/`` for QA and remote
+    troubleshooting. The manifest is just another uploaded file
+    (``manifest.json``) -- no DB, no server-side run state.
+    """
+    _check_auth(authorization)
+    run_id = _sanitize_component(body.run_id)
+    filename = _sanitize_component(body.filename)
+    if not run_id or not filename:
+        raise HTTPException(status_code=400, detail="invalid run_id or filename")
+    month = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
+    object_name = f"runs/{month}/{run_id}/{filename}"
     content_type = "application/octet-stream"
     return UploadUrlResponse(object_name=object_name,
                              url=_signed_put_url(object_name, content_type),

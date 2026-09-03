@@ -200,4 +200,9 @@ def export_case(case: dict, volume, out_dir: str,
             save_mask_nifti(bodyfull, volume.spacing,
                             os.path.join(mdir, f"{lvl}_body.nii.gz"))
         written["masks"] = mdir
+
+    # Archive the exported (reviewed/final) numbers to the cloud under the same
+    # run id as the analysis, best-effort in a background thread (never raises).
+    from .cloud_archive import archive_export
+    archive_export(case, out_dir, written)
     return written

@@ -139,3 +139,64 @@ def test_segment_status_unknown_job(monkeypatch):
     client, _ = _client(monkeypatch)
     r = client.get("/segment-status/does-not-exist")
     assert r.status_code == 404
+
+
+# ---- /runs/upload-url (run archival) ----------------------------------------
+
+def test_runs_upload_url_mints_scoped_object(monkeypatch):
+    client, server_app = _client(monkeypatch)
+    monkeypatch.setattr(server_app, "_signed_put_url",
+                        lambda obj, ct: f"https://signed/{obj}?ct={ct}")
+    r = client.post("/runs/upload-url",
+                    json={"run_id": "20260101T000000Z-abcd1234",
+                          "filename": "manifest.json"})
+    assert r.status_code == 200
+    body = r.json()
+    import re
+    assert re.fullmatch(
+        r"runs/\d{4}-\d{2}/20260101T000000Z-abcd1234/manifest\.json",
+        body["object_name"]), body["object_name"]
+    assert body["url"].startswith("https://signed/runs/")
+
+
+def test_runs_upload_url_requires_auth_when_key_set(monkeypatch):
+    client, server_app = _client(monkeypatch, api_key="secret")
+    monkeypatch.setattr(server_app, "_signed_put_url",
+                        lambda obj, ct: f"https://signed/{obj}")
+    r = client.post("/runs/upload-url",
+                    json={"run_id": "r", "filename": "manifest.json"})
+    assert r.status_code == 401
+    r = client.post("/runs/upload-url",
+                    headers={"Authorization": "Bearer secret"},
+                    json={"run_id": "r1", "filename": "f.json"})
+    assert r.status_code == 200
+
+
+def test_runs_upload_url_sanitizes_traversal(monkeypatch):
+    client, server_app = _client(monkeypatch)
+    monkeypatch.setattr(server_app, "_signed_put_url",
+                        lambda obj, ct: f"https://signed/{obj}")
+    r = client.post("/runs/upload-url",
+                    json={"run_id": "../../etc", "filename": "../../passwd"})
+    assert r.status_code == 200
+    obj = r.json()["object_name"]
+    assert ".." not in obj
+    # both components collapsed to safe names inside the runs/ prefix
+    assert obj.startswith("runs/") and obj.endswith("/passwd")
+
+    r = client.post("/runs/upload-url",
+                    json={"run_id": "a/b\\c", "filename": "x y!.json"})
+    assert r.status_code == 200
+    obj = r.json()["object_name"]
+    assert " " not in obj and "\\" not in obj
+    assert obj.count("/") == 3          # runs/<month>/<run_id>/<filename>
+
+
+def test_runs_upload_url_rejects_empty_components(monkeypatch):
+    client, server_app = _client(monkeypatch)
+    monkeypatch.setattr(server_app, "_signed_put_url",
+                        lambda obj, ct: f"https://signed/{obj}")
+    r = client.post("/runs/upload-url", json={"run_id": "..", "filename": "f"})
+    assert r.status_code == 400
+    r = client.post("/runs/upload-url", json={"run_id": "r", "filename": "..."})
+    assert r.status_code == 400

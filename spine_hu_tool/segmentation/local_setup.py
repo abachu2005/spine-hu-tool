@@ -4,8 +4,8 @@ The packaged desktop app ships lean (no PyTorch / TotalSegmentator) and segments
 on the cloud by default. A user who wants to run segmentation on their own
 machine can install the heavy ML stack once into a *managed* environment that
 lives in a user-writable data directory (outside the read-only app bundle). The
-app then runs that environment's ``TotalSegmentator`` console script as a
-subprocess.
+app then runs TotalSegmentator as a subprocess of that environment's Python
+(never its console-script executables -- see the trampoline note below).
 
 To make this work on ANY machine -- with no preinstalled Python -- setup
 bootstraps `uv` (a single self-contained binary from Astral), which downloads
@@ -25,7 +25,9 @@ import tarfile
 import zipfile
 import tempfile
 import urllib.request
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
+
+from ..errors import UserFacingError
 
 ProgressCb = Optional[Callable[[str], None]]
 
@@ -101,10 +103,29 @@ def managed_python() -> Optional[str]:
     return cand if os.path.exists(cand) else None
 
 
-def managed_ts_binary() -> Optional[str]:
-    """Path to the managed env's TotalSegmentator script, or None."""
-    cand = os.path.join(_venv_bin_dir(managed_env_dir()), _exe("TotalSegmentator"))
-    return cand if os.path.exists(cand) else None
+# --- console-script-free entrypoints ------------------------------------------
+#
+# NEVER invoke the env's console-script executables (TotalSegmentator.exe etc.):
+# on Windows those are uv/pip trampolines that embed absolute build paths and
+# break when the env is relocated (the shipped v0.2.0 bundle) or when the path
+# contains spaces ("C:\Program Files\...", a known uv trampoline bug). Running
+# the interpreter itself with a -c shim is immune to both, and to missing
+# __main__ guards.
+
+_TS_ENTRY = ("import sys; from totalsegmentator.bin.TotalSegmentator "
+             "import main; sys.exit(main())")
+_DL_ENTRY = ("import sys; from totalsegmentator.bin.totalseg_download_weights "
+             "import main; sys.exit(main())")
+
+
+def ts_command(python: str, *ts_args: str) -> list:
+    """Command that runs TotalSegmentator through the given interpreter."""
+    return [python, "-c", _TS_ENTRY, *ts_args]
+
+
+def weights_download_command(python: str, task: str) -> list:
+    """Command that pre-downloads a weights task through the interpreter."""
+    return [python, "-c", _DL_ENTRY, "-t", task]
 
 
 # --- bundled runtime (shipped inside the installer) ---------------------------
@@ -158,13 +179,49 @@ def bundled_env_dir() -> Optional[str]:
     return None
 
 
-def bundled_ts_binary() -> Optional[str]:
-    """Path to the bundled TotalSegmentator console script, or None."""
-    env_dir = bundled_env_dir()
-    if env_dir is None:
+def find_runtime_python(root: Optional[str]) -> Optional[str]:
+    """Locate a CPython interpreter inside an installed runtime directory.
+
+    Handles every layout we ship or shipped:
+      - standalone CPython installed into the bundle by uv
+        (``<root>/cpython-3.11.x-<platform>/{python.exe | bin/python3.x}``)
+      - a flat standalone build (``<root>/{python.exe | bin/python3}``)
+      - a legacy venv (``<root>/{Scripts | bin}/python[.exe]``)
+    """
+    if not root or not os.path.isdir(root):
         return None
-    cand = os.path.join(_venv_bin_dir(env_dir), _exe("TotalSegmentator"))
-    return cand if os.path.exists(cand) else None
+    bases = [root]
+    try:
+        bases += sorted(os.path.join(root, d) for d in os.listdir(root)
+                        if d.startswith("cpython-")
+                        and os.path.isdir(os.path.join(root, d)))
+    except OSError:
+        return None
+    for base in bases:
+        subdirs = ("", "Scripts") if _IS_WIN else ("bin", "")
+        for sub in subdirs:
+            d = os.path.join(base, sub) if sub else base
+            if _IS_WIN:
+                cand = os.path.join(d, "python.exe")
+                if os.path.isfile(cand):
+                    return cand
+            else:
+                try:
+                    names = sorted(os.listdir(d))
+                except OSError:
+                    continue
+                for n in names:
+                    if n == "python3" or n == "python" or (
+                            n.startswith("python3.") and not n.endswith("-config")):
+                        cand = os.path.join(d, n)
+                        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                            return cand
+    return None
+
+
+def bundled_python() -> Optional[str]:
+    """Interpreter of the runtime bundled with the installer, or None."""
+    return find_runtime_python(bundled_env_dir())
 
 
 def bundled_weights_dir() -> Optional[str]:
@@ -200,16 +257,105 @@ def weights_home() -> Optional[str]:
 
 def is_ready() -> bool:
     """True if the managed local-segmentation runtime is fully installed."""
-    py = managed_python()
-    if py is None or managed_ts_binary() is None:
-        return False
+    ok, _ = verify_runtime(managed_python())
+    return ok
+
+
+# --- runtime health check + resolution -----------------------------------------
+
+# verify_runtime results per interpreter path; a health check launches a Python
+# and imports torch (seconds), so it runs once per process, not once per run.
+_VERIFY_CACHE: dict = {}
+
+
+def clear_verify_cache() -> None:
+    _VERIFY_CACHE.clear()
+
+
+def verify_runtime(python: Optional[str], *, use_cache: bool = True,
+                   timeout: float = 180) -> Tuple[bool, str]:
+    """Preflight health check: can ``python`` import torch + totalsegmentator?
+
+    Returns ``(ok, reason)`` where ``reason`` is the captured import error /
+    launch failure when not ok. Run with the sanitized :func:`child_env` -- the
+    same environment real runs use -- so it catches the frozen-app env-leak
+    class of failure too.
+    """
+    if not python or not os.path.exists(python):
+        return False, f"interpreter not found ({python!r})"
+    key = os.path.abspath(python)
+    if use_cache and key in _VERIFY_CACHE:
+        return _VERIFY_CACHE[key]
     try:
-        r = subprocess.run([py, "-c", "import torch, totalsegmentator"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=180, env=child_env())
-        return r.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
+        r = subprocess.run([python, "-c", "import torch, totalsegmentator"],
+                           capture_output=True, text=True, timeout=timeout,
+                           env=child_env())
+        ok = r.returncode == 0
+        reason = "" if ok else (r.stderr or r.stdout or "").strip()[-2000:]
+    except (OSError, subprocess.SubprocessError) as e:
+        ok, reason = False, f"failed to launch the runtime: {e}"
+    result = (ok, reason)
+    _VERIFY_CACHE[key] = result
+    return result
+
+
+def runtime_candidates() -> list:
+    """``(source, python)`` pairs in preference order (existence-checked only).
+
+    Order: the runtime bundled inside the installer, then the user-data managed
+    env (which is also the repair target, so a repaired env can take over from a
+    broken bundled one), then the host interpreter for source installs with the
+    ``local-seg`` extra.
+    """
+    out = []
+    b = bundled_python()
+    if b:
+        out.append(("bundled", b))
+    m = managed_python()
+    if m:
+        out.append(("managed", m))
+    try:
+        import importlib.util
+        if importlib.util.find_spec("totalsegmentator") is not None:
+            out.append(("host", sys.executable))
+    except Exception:
+        pass
+    return out
+
+
+def _active_overrides() -> list:
+    return [f"{v}={os.environ[v]}"
+            for v in ("SPINE_HU_BUNDLED_ENV", "SPINE_HU_BUNDLED_WEIGHTS",
+                      "SPINE_HU_LOCALSEG_ENV", "SPINE_HU_WEIGHTS_HOME")
+            if os.environ.get(v)]
+
+
+def resolve_runtime() -> Tuple[str, str]:
+    """Return ``(python, source)`` of the first healthy local-seg runtime.
+
+    Tries every candidate (bundled -> managed -> host) and health-checks each.
+    Raises :class:`UserFacingError` naming every resolved path, its failure
+    reason, and any active ``SPINE_HU_*`` overrides when none is usable.
+    """
+    failures = []
+    for source, py in runtime_candidates():
+        ok, reason = verify_runtime(py)
+        if ok:
+            return py, source
+        failures.append(f"[{source}] {py}:\n{reason}")
+    detail = ("\n\n".join(failures)
+              or "No local segmentation runtime found (no bundled runtime, no "
+                 "managed env, and TotalSegmentator is not importable).")
+    overrides = _active_overrides()
+    if overrides:
+        detail += "\n\nActive environment overrides: " + ", ".join(overrides)
+    raise UserFacingError(
+        title="Local segmentation isn't working",
+        message="Local segmentation on this computer isn't working.",
+        remedy="Click 'Repair local segmentation' to reinstall it (needs "
+               "internet, a few minutes), or click 'Use cloud instead' to "
+               "continue right now.",
+        detail=detail, kind="local-runtime-broken")
 
 
 # --- uv bootstrap (provides a standalone Python; no system Python needed) -----
@@ -295,26 +441,46 @@ def _venv_python(env_dir: str) -> Optional[str]:
     return cand if os.path.exists(cand) else None
 
 
-def _venv_ts_binary(env_dir: str) -> Optional[str]:
-    cand = os.path.join(_venv_bin_dir(env_dir), _exe("TotalSegmentator"))
-    return cand if os.path.exists(cand) else None
+def _download_weights(py: str, weights_dir: Optional[str], weight_tasks,
+                      progress: ProgressCb, weights_fatal: bool) -> None:
+    """Pre-download model weights through the env's interpreter (no console
+    script -- see the trampoline note above) so the first real run is offline."""
+    dl_env = child_env({"TOTALSEG_HOME_DIR": weights_dir,
+                        "TOTALSEG_WEIGHTS_PATH": weights_dir})
+    if weights_dir:
+        os.makedirs(weights_dir, exist_ok=True)
+    for task in weight_tasks:
+        try:
+            _run(weights_download_command(py, task), progress,
+                 f"Downloading segmentation model weights ({task})...",
+                 env=dl_env)
+        except RuntimeError:
+            if weights_fatal:
+                raise
+            if progress:
+                progress(f"Weight pre-download ({task}) skipped; will "
+                         "download on first run.")
 
 
 def provision_env(env_dir: str, *, weights_dir: Optional[str] = None,
                   weight_tasks=("total_fast",), progress: ProgressCb = None,
                   weights_fatal: bool = False) -> str:
-    """Install a self-contained torch + TotalSegmentator env into ``env_dir``.
+    """Install a self-contained torch + TotalSegmentator venv into ``env_dir``.
 
-    Shared by the on-demand user install (:func:`setup_local_seg`) and the
-    packaging build script. Bootstraps ``uv`` (which downloads a standalone
-    CPython -- no system Python needed), installs CPU PyTorch + TotalSegmentator,
-    and pre-downloads the given weight ``weight_tasks``. When ``weights_dir`` is
-    given, weights are downloaded there (via ``TOTALSEG_HOME_DIR``) so they can
-    be bundled separately from the env. Returns the TotalSegmentator binary path.
+    Used by the on-demand user install (:func:`setup_local_seg`), where the env
+    is created IN PLACE on the user's machine and never moves, so a venv is
+    fine. (The installer bundle must NOT use this: a venv references the
+    CPython that created it and breaks when relocated -- the v0.2.0 bug. The
+    bundle uses ``packaging/build_localseg_env.py``'s standalone runtime.)
 
-    ``weights_fatal`` makes a failed weight download raise (used by the build so
-    an installer never ships without weights); the on-demand path treats it as
-    best-effort since weights otherwise download on first use.
+    Bootstraps ``uv`` (which downloads a standalone CPython -- no system Python
+    needed), installs CPU PyTorch + TotalSegmentator, and pre-downloads the
+    given weight ``weight_tasks``. When ``weights_dir`` is given, weights are
+    downloaded there (via ``TOTALSEG_HOME_DIR``) so they can live separately
+    from the env. Returns the env's Python interpreter path.
+
+    ``weights_fatal`` makes a failed weight download raise; the on-demand path
+    treats it as best-effort since weights otherwise download on first use.
     """
     os.makedirs(os.path.dirname(env_dir) or ".", exist_ok=True)
     uv = _ensure_uv(progress)
@@ -346,30 +512,9 @@ def provision_env(env_dir: str, *, weights_dir: Optional[str] = None,
 
     _uv_pip_install(["TotalSegmentator"], "Installing TotalSegmentator...")
 
-    # Pre-download model weights so the first real run works offline. The console
-    # script ships with TotalSegmentator.
-    dl = os.path.join(_venv_bin_dir(env_dir), _exe("totalseg_download_weights"))
-    if os.path.exists(dl):
-        dl_env = child_env({"TOTALSEG_HOME_DIR": weights_dir,
-                            "TOTALSEG_WEIGHTS_PATH": weights_dir})
-        if weights_dir:
-            os.makedirs(weights_dir, exist_ok=True)
-        for task in weight_tasks:
-            try:
-                _run([dl, "-t", task], progress,
-                     f"Downloading segmentation model weights ({task})...",
-                     env=dl_env)
-            except RuntimeError:
-                if weights_fatal:
-                    raise
-                if progress:
-                    progress(f"Weight pre-download ({task}) skipped; will "
-                             "download on first run.")
-
-    ts = _venv_ts_binary(env_dir)
-    if ts is None:
-        raise RuntimeError("Install completed but TotalSegmentator was not found.")
-    return ts
+    _download_weights(py, weights_dir, weight_tasks, progress, weights_fatal)
+    clear_verify_cache()               # a fresh env invalidates cached health
+    return py
 
 
 def setup_local_seg(progress: ProgressCb = None) -> str:
@@ -377,15 +522,84 @@ def setup_local_seg(progress: ProgressCb = None) -> str:
 
     Self-contained: bootstraps `uv`, which downloads a standalone Python, then
     installs a CPU PyTorch + TotalSegmentator and pre-downloads the model
-    weights. Returns the managed TotalSegmentator binary path. Safe to re-run.
+    weights. Returns the managed env's Python path. Safe to re-run.
     """
     if is_ready():
         if progress:
             progress("Local segmentation already installed.")
-        return managed_ts_binary()  # type: ignore[return-value]
+        return managed_python()  # type: ignore[return-value]
 
-    ts = provision_env(managed_env_dir(), weight_tasks=("total_fast",),
+    py = provision_env(managed_env_dir(), weight_tasks=("total_fast",),
                        progress=progress)
+    ok, reason = verify_runtime(py, use_cache=False)
+    if not ok:
+        raise UserFacingError(
+            title="Local setup failed",
+            message="The local segmentation runtime was installed but failed "
+                    "its health check.",
+            remedy="Try 'Set up local segmentation' again; if it keeps "
+                   "failing, use cloud segmentation and send us the log file.",
+            detail=f"{py}:\n{reason}", kind="setup-failed")
     if progress:
         progress("Local segmentation is ready.")
-    return ts
+    return py
+
+
+def classify_setup_error(exc: BaseException) -> UserFacingError:
+    """Turn a raw setup/repair failure into an actionable user-facing error.
+
+    Distinguishes the two failure modes a user can actually fix themselves --
+    no internet and no disk space -- from everything else, instead of showing
+    raw pip/uv output as the headline.
+    """
+    if isinstance(exc, UserFacingError):
+        return exc
+    s = str(exc)
+    low = s.lower()
+    if any(k in low for k in (
+            "no space left", "disk full", "errno 28", "not enough space",
+            "insufficient disk", "disk quota")):
+        return UserFacingError(
+            title="Not enough disk space",
+            message="There isn't enough free disk space to install local "
+                    "segmentation (it needs about 3 GB free).",
+            remedy="Free up disk space, then click 'Set up local "
+                   "segmentation' again.",
+            detail=s, kind="setup-failed")
+    if any(k in low for k in (
+            "getaddrinfo", "name resolution", "temporary failure",
+            "connection", "network", "timed out", "timeout", "unreachable",
+            "ssl", "proxy", "url error", "urlopen", "http error 5")):
+        return UserFacingError(
+            title="Couldn't download the components",
+            message="Local segmentation setup needs to download its "
+                    "components, but the download failed -- this usually "
+                    "means no internet connection.",
+            remedy="Connect to the internet and click 'Set up local "
+                   "segmentation' again. On a hospital network, a firewall "
+                   "or proxy may be blocking downloads.",
+            detail=s, kind="setup-failed")
+    return UserFacingError(
+        title="Local setup failed",
+        message="Local segmentation could not be installed on this computer.",
+        remedy="Try again; if it keeps failing, use cloud segmentation "
+               "(uncheck 'Run segmentation on this computer') and send us "
+               "the log file.",
+        detail=s, kind="setup-failed")
+
+
+def repair_local_seg(progress: ProgressCb = None) -> str:
+    """Delete the managed env and re-provision it from scratch.
+
+    The bundled runtime lives in the read-only app directory, so 'repair' means
+    rebuilding the user-data managed env -- which :func:`runtime_candidates`
+    prefers over a bundled runtime that fails its health check. Returns the
+    fresh env's Python path.
+    """
+    env_dir = managed_env_dir()
+    if os.path.isdir(env_dir):
+        if progress:
+            progress("Removing the existing local environment...")
+        shutil.rmtree(env_dir, ignore_errors=True)
+    clear_verify_cache()
+    return setup_local_seg(progress=progress)

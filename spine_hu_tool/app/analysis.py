@@ -11,6 +11,8 @@ from typing import Callable, Optional
 
 from ..io.series_selector import select_ct_series, SeriesInfo
 from ..io.dicom_loader import load_series
+from ..export.cloud_archive import (RunArchiver, archive_analysis_failure,
+                                    archive_analysis_success)
 from ..segmentation.backends import segment, resolve_seg_url
 from ..config import ROIParams, ScoutParams
 from .review_state import ReviewState
@@ -161,6 +163,36 @@ def analyze_dataset(folder: str, series: Optional[SeriesInfo] = None,
     if fast is None:
         fast = False
 
+    # Every run -- local or cloud, success or failure -- is archived to the
+    # hosted service for QA/record keeping/remote troubleshooting. Best-effort
+    # daemon-thread uploads; never blocks, slows, or fails an analysis.
+    # analyze_dataset is the single chokepoint, so GUI, CLI, and batch runs all
+    # archive without their own hooks.
+    import time as _time
+    archiver = RunArchiver(seg_url=seg_url, api_key=api_key)
+    backend = "cloud" if remote else "local"
+    _t_start = _time.time()
+
+    try:
+        return _analyze_dataset_inner(
+            folder, series, mode, only_clean, fast, reviewer, params, seg_url,
+            api_key, local, compute_comparison, apply_calibration, scout,
+            scout_params, report, remote, archiver, backend, _t_start)
+    except Exception as exc:
+        archive_analysis_failure(
+            archiver, exc, backend=backend, mode=mode, fast=fast,
+            series=series, work_dir=_seg_cache_dir(),
+            name=(_safe_name(series) if series is not None else None),
+            folder=folder)
+        raise
+
+
+def _analyze_dataset_inner(folder, series, mode, only_clean, fast, reviewer,
+                           params, seg_url, api_key, local, compute_comparison,
+                           apply_calibration, scout, scout_params, report,
+                           remote, archiver, backend, _t_start) -> ReviewState:
+    import time as _time
+
     # Progress model:
     #   ingest/select : 0.00 - 0.08 (determinate)
     #   segmentation  : indeterminate (frac = -1.0; UI shows a busy bar) because
@@ -172,7 +204,13 @@ def analyze_dataset(folder: str, series: Optional[SeriesInfo] = None,
     if series is None:
         series, candidates = select_ct_series(folder)
     if series is None:
-        raise RuntimeError("No usable axial CT series found in folder.")
+        from ..errors import UserFacingError
+        raise UserFacingError(
+            title="No CT series found",
+            message=f"No usable axial CT series was found in:\n{folder}",
+            remedy="Choose the folder that contains the DICOM files themselves "
+                   "(often a deeper folder than the disc root), then try again.",
+            detail=f"scanned folder: {folder}", kind="no-series")
 
     report(f"Loading series ({series.n_files} slices)...", 0.08)
     volume = load_series(series.files, metadata={
@@ -197,9 +235,11 @@ def analyze_dataset(folder: str, series: Optional[SeriesInfo] = None,
     else:
         report("Segmenting vertebrae (first run also downloads the model; "
                "this can take a few minutes)...", -1.0)
+    _t_seg = _time.time()
     seg = segment(volume, cache, name, fast=fast, local=local,
                   seg_url=seg_url, api_key=api_key,
                   progress=lambda m, _f: report(m, -1.0))
+    seg_seconds = _time.time() - _t_seg
 
     audit_path = os.path.join(cache, f"{name}_audit.json")
     state = ReviewState.from_volume(
@@ -218,5 +258,15 @@ def analyze_dataset(folder: str, series: Optional[SeriesInfo] = None,
         except Exception as exc:
             state.case["scout"] = {"available": False, "views": {}, "levels": {},
                                    "warnings": [f"scout measurement failed: {exc}"]}
+
+    # Tag the state with the archive id (export/finalize reuses it) and ship
+    # the run to the cloud archive in the background.
+    state.case["archive_run_id"] = archiver.run_id
+    archive_analysis_success(
+        archiver, state, backend=backend, mode=mode, fast=fast, series=series,
+        work_dir=cache, name=name,
+        timings={"segmentation_s": round(seg_seconds, 1),
+                 "seg_cached": seg_cached,
+                 "total_s": round(_time.time() - _t_start, 1)})
     report("Done.", 1.0)
     return state

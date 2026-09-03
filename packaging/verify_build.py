@@ -6,8 +6,14 @@ build reaches a user. It:
 
   1. locates the bundled localseg-env + totalseg-weights inside the app,
   2. imports torch + totalsegmentator inside the bundled Python with a sanitized
-     environment (the same one the app uses), and
-  3. optionally runs a tiny real segmentation to prove offline inference works.
+     environment (the same one the app uses),
+  3. SIMULATES A USER MACHINE: copies the bundled runtime to a temp directory
+     whose path contains spaces (like "C:\\Program Files\\Spine HU Tool"),
+     hides uv's python store, and repeats the health check plus a
+     TotalSegmentator --help invocation through the relocated interpreter.
+     A runtime that only works in situ -- the v0.2.0 bug, where the bundled
+     venv referenced the CI runner's Python -- fails the release here, and
+  4. optionally runs a tiny real segmentation to prove offline inference works.
 
 Usage:
     python packaging/verify_build.py --app "packaging/dist/Spine HU Tool.app"
@@ -20,6 +26,7 @@ lightweight (still confirms weights exist for offline use).
 from __future__ import annotations
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,7 +37,7 @@ from spine_hu_tool.segmentation import local_setup as ls  # noqa: E402
 
 
 def _resolve(app_path: str):
-    """Point discovery at the app and return (env_dir, ts_binary, weights_dir)."""
+    """Point discovery at the app and return (env_dir, python, weights_dir)."""
     # macOS .app -> Contents/Resources; onedir -> the dir itself (or _internal).
     candidates = [app_path,
                   os.path.join(app_path, "Contents", "Resources"),
@@ -42,8 +49,56 @@ def _resolve(app_path: str):
             os.environ["SPINE_HU_BUNDLED_ENV"] = env_dir
             if os.path.isdir(weights):
                 os.environ["SPINE_HU_BUNDLED_WEIGHTS"] = weights
-            return env_dir, ls.bundled_ts_binary(), (weights if os.path.isdir(weights) else None)
+            return env_dir, ls.bundled_python(), (weights if os.path.isdir(weights) else None)
     return None, None, None
+
+
+def _user_machine_env(extra: dict | None = None) -> dict:
+    """child_env plus 'this machine has no uv pythons and no dev checkout'."""
+    hidden = tempfile.mkdtemp(prefix="no-pythons-")
+    env = ls.child_env({"UV_PYTHON_INSTALL_DIR": hidden, **(extra or {})})
+    return env
+
+
+def _check_runtime(py: str, weights: str, label: str) -> bool:
+    """Import health check + a TotalSegmentator --help through `py`."""
+    env = _user_machine_env({"TOTALSEG_HOME_DIR": weights,
+                             "TOTALSEG_WEIGHTS_PATH": weights})
+    r = subprocess.run(
+        [py, "-c", "import torch, totalsegmentator; print(torch.__version__)"],
+        env=env, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        print(f"FAIL: {label}: could not import torch/totalsegmentator via {py}:")
+        print((r.stderr or r.stdout)[-2000:])
+        return False
+    print(f"OK: {label}: imports work (torch {r.stdout.strip()})")
+
+    r = subprocess.run(ls.ts_command(py, "--help"),
+                       env=env, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        print(f"FAIL: {label}: TotalSegmentator --help failed via {py}:")
+        print((r.stderr or r.stdout)[-2000:])
+        return False
+    print(f"OK: {label}: TotalSegmentator entrypoint runs")
+    return True
+
+
+def _check_relocated(env_dir: str, weights: str) -> bool:
+    """Copy the runtime to a path WITH SPACES and re-check it there.
+
+    This is the check that would have caught the v0.2.0 bundle: on the build
+    machine the original paths still resolve, so an in-situ check passes even
+    for a completely non-relocatable runtime.
+    """
+    with tempfile.TemporaryDirectory(prefix="spine-hu-verify-") as tmp:
+        target = os.path.join(tmp, "Relocated App Dir", "localseg-env")
+        print(f"Relocating runtime to a spaced path: {target}")
+        shutil.copytree(env_dir, target, symlinks=True)
+        py = ls.find_runtime_python(target)
+        if py is None:
+            print("FAIL: no interpreter found in the relocated runtime.")
+            return False
+        return _check_runtime(py, weights, "relocated (spaced path, no uv pythons)")
 
 
 def main(argv=None) -> int:
@@ -53,39 +108,26 @@ def main(argv=None) -> int:
                     help="also run a tiny real segmentation (needs RAM; offline)")
     args = ap.parse_args(argv)
 
-    env_dir, ts, weights = _resolve(os.path.abspath(args.app))
+    env_dir, py, weights = _resolve(os.path.abspath(args.app))
     if env_dir is None:
         print("FAIL: no bundled localseg-env found in the app.")
         return 1
     print(f"OK: localseg-env at {env_dir}")
-    if ts is None or not os.path.exists(ts):
-        print("FAIL: bundled TotalSegmentator binary missing.")
+    if py is None:
+        print("FAIL: no Python interpreter found in the bundled runtime.")
         return 1
-    print(f"OK: TotalSegmentator at {ts}")
+    print(f"OK: bundled Python at {py}")
     if weights is None or not any(os.scandir(weights)):
         print("FAIL: bundled totalseg-weights missing or empty (offline run "
               "would try to download).")
         return 1
     print(f"OK: weights at {weights}")
 
-    bindir = "Scripts" if sys.platform.startswith("win") else "bin"
-    pyexe = "python" + (".exe" if sys.platform.startswith("win") else "")
-    py = os.path.join(env_dir, bindir, pyexe)
-    if not os.path.exists(py):
-        print(f"FAIL: bundled Python missing at {py}")
+    if not _check_runtime(py, weights, "in situ"):
         return 1
 
-    # Import torch + totalsegmentator in the bundled Python with the app's
-    # sanitized environment (this catches the frozen-app env-leak class of bug).
-    env = ls.child_env({"TOTALSEG_HOME_DIR": weights,
-                        "TOTALSEG_WEIGHTS_PATH": weights})
-    r = subprocess.run([py, "-c", "import torch, totalsegmentator; print(torch.__version__)"],
-                       env=env, capture_output=True, text=True, timeout=300)
-    if r.returncode != 0:
-        print("FAIL: bundled Python could not import torch/totalsegmentator:")
-        print(r.stderr[-2000:])
+    if not _check_relocated(env_dir, weights):
         return 1
-    print(f"OK: bundled runtime imports (torch {r.stdout.strip()})")
 
     if args.run_seg:
         print("Running a tiny offline segmentation (this needs RAM)...")

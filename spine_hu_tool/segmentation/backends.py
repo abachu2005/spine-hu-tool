@@ -17,10 +17,44 @@ from typing import Callable, Optional
 import numpy as np
 
 from ..core import Volume
+from ..errors import UserFacingError
 from ..io.nifti_io import save_volume_nifti
 from .totalseg_runner import run_segmentation, load_segmentation
 
 ProgressCb = Optional[Callable[[str, float], None]]
+
+# Download page linked from the "app outdated" dialog.
+DOWNLOAD_PAGE_URL = "https://storage.googleapis.com/spine-hu-tool-downloads/index.html"
+
+
+def _cloud_unreachable(detail: str, *, timed_out: bool = False) -> UserFacingError:
+    return UserFacingError(
+        title="Couldn't reach the segmentation service",
+        message=("The cloud segmentation run took too long and timed out."
+                 if timed_out else
+                 "The segmentation service couldn't be reached."),
+        remedy="Check the internet connection and try again; if you're on a "
+               "hospital network, a firewall may be blocking it. The server "
+               "URL is on the start screen.",
+        detail=detail, kind="cloud-timeout" if timed_out else "cloud-unreachable")
+
+
+def _cloud_rejected(status: int, detail: str) -> UserFacingError:
+    if status in (401, 403):
+        return UserFacingError(
+            title="Segmentation service rejected the request",
+            message="The segmentation service rejected the request -- this "
+                    "usually means the app is outdated.",
+            remedy="Please download the latest version from the download "
+                   f"page: {DOWNLOAD_PAGE_URL}",
+            detail=detail, kind="cloud-rejected")
+    return UserFacingError(
+        title="Segmentation service rejected the request",
+        message=f"The segmentation service rejected the request "
+                f"(HTTP {status}).",
+        remedy="Try again; if this keeps happening, download the latest "
+               f"version from {DOWNLOAD_PAGE_URL} or send us the log file.",
+        detail=detail, kind="cloud-rejected")
 
 # Cloud Run is the DEFAULT backend: the heavy TotalSegmentator step is never run
 # on the clinician's machine unless the URL is explicitly cleared. The endpoint
@@ -119,7 +153,9 @@ def segment(volume: Volume, work_dir: str, name: str, *,
                                fast=fast, force=force, timeout=eff_timeout,
                                progress=progress)
     except RuntimeError as exc:
-        if fast or "timed out" not in str(exc).lower():
+        timed_out = (getattr(exc, "kind", "") == "cloud-timeout"
+                     or "timed out" in str(exc).lower())
+        if fast or not timed_out:
             raise
         if progress:
             progress("Full-resolution segmentation is taking too long on the "
@@ -177,20 +213,21 @@ def _segment_remote(volume: Volume, work_dir: str, name: str, url: str,
             try:
                 resp = fn()
             except requests.RequestException as exc:
-                last_err = RuntimeError(f"{label} failed (network): {exc}")
+                last_err = _cloud_unreachable(f"{label} failed (network): {exc}")
             else:
                 if resp.status_code in (200, 201):
                     return resp
                 if resp.status_code < 500:
-                    raise RuntimeError(
+                    raise _cloud_rejected(
+                        resp.status_code,
                         f"{label} failed ({resp.status_code}): {resp.text[:300]}")
-                last_err = RuntimeError(
+                last_err = _cloud_unreachable(
                     f"{label} failed ({resp.status_code}): {resp.text[:200]}")
             if i < attempts - 1:
                 wait = min(2 ** i, 8) + random.random()
                 _report(f"{label}: transient cloud error, retrying in {wait:.0f}s...")
                 time.sleep(wait)
-        raise last_err or RuntimeError(f"{label} failed")
+        raise last_err or _cloud_unreachable(f"{label} failed")
 
     # 1. mint a signed upload URL
     _report("Requesting upload URL...")
@@ -232,22 +269,35 @@ def _segment_remote(volume: Volume, work_dir: str, name: str, url: str,
         except requests.RequestException:
             continue   # transient network blip; keep polling
         if st.status_code != 200:
-            raise RuntimeError(
-                f"Status check failed ({st.status_code}): {st.text[:300]}")
+            if st.status_code < 500:
+                raise _cloud_rejected(
+                    st.status_code,
+                    f"status check failed ({st.status_code}): {st.text[:300]}")
+            raise _cloud_unreachable(
+                f"status check failed ({st.status_code}): {st.text[:300]}")
         info = st.json()
         if info["status"] == "done":
             result_url = info["result_url"]
             break
         if info["status"] == "error":
-            raise RuntimeError(f"Remote segmentation failed: {info.get('error')}")
+            raise UserFacingError(
+                title="Cloud segmentation failed",
+                message="Segmentation failed on the cloud service.",
+                remedy="Try again; if this keeps happening, send us the log "
+                       "file so we can look at the failed job.",
+                detail=f"remote job {job_id} error: {info.get('error')}",
+                kind="cloud-failed")
     if result_url is None:
-        raise RuntimeError("Remote segmentation timed out")
+        raise _cloud_unreachable(
+            f"remote job {job_id} did not finish within {timeout:.0f}s",
+            timed_out=True)
 
     # 5. download the mask straight from GCS
     _report("Downloading segmentation mask...")
     dl = requests.get(result_url, timeout=600, stream=True)
     if dl.status_code != 200:
-        raise RuntimeError(f"Mask download failed ({dl.status_code}): {dl.text[:300]}")
+        raise _cloud_unreachable(
+            f"mask download failed ({dl.status_code}): {dl.text[:300]}")
     with open(seg_path, "wb") as out:
         for chunk in dl.iter_content(chunk_size=1 << 20):
             if chunk:

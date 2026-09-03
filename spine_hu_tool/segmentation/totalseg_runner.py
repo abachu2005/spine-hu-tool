@@ -7,7 +7,6 @@ so the deterministic ROI placement is unaffected.
 """
 from __future__ import annotations
 import os
-import sys
 import subprocess
 import functools
 from typing import Optional
@@ -72,38 +71,26 @@ def load_segmentation(path: str) -> np.ndarray:
     return arr.astype(np.int16)
 
 
-def _ts_binary() -> Optional[str]:
-    """Path to the TotalSegmentator console script, or None if not installed.
+def _ts_python() -> Optional[str]:
+    """Interpreter of the first local-seg runtime that EXISTS, or None.
 
-    Resolution order (first hit wins):
-      1. runtime bundled inside the installer (full offline build)
-      2. a TotalSegmentator installed next to this Python / on PATH (dev installs)
-      3. the app-managed local-seg env, installed on demand by the user
+    Existence-only (no health check) so it stays cheap for availability
+    display; real runs resolve through :func:`local_setup.resolve_runtime`,
+    which health-checks each candidate. TotalSegmentator is always invoked
+    through a runtime's Python with a ``-c`` entry shim -- never through the
+    console-script executables, whose Windows trampolines embed absolute build
+    paths and break on relocation or paths with spaces (the v0.2.0 bug).
 
-    A lean cloud-only build has none of these, so this can legitimately be None.
+    A lean cloud-only build has no runtime, so this can legitimately be None.
     """
-    import shutil
-    from .local_setup import bundled_ts_binary, managed_ts_binary
-
-    bundled = bundled_ts_binary()
-    if bundled:
-        return bundled
-    cand = os.path.join(os.path.dirname(sys.executable), _exe("TotalSegmentator"))
-    if os.path.exists(cand):
-        return cand
-    on_path = shutil.which("TotalSegmentator")
-    if on_path:
-        return on_path
-    return managed_ts_binary()
-
-
-def _exe(name: str) -> str:
-    return name + ".exe" if sys.platform.startswith("win") else name
+    from .local_setup import runtime_candidates
+    cands = runtime_candidates()
+    return cands[0][1] if cands else None
 
 
 def local_seg_available() -> bool:
-    """True if TotalSegmentator is installed so segmentation can run locally."""
-    return _ts_binary() is not None
+    """True if a local segmentation runtime is installed on this machine."""
+    return _ts_python() is not None
 
 
 def run_segmentation(volume: Volume, work_dir: str, name: str,
@@ -123,17 +110,11 @@ def run_segmentation(volume: Volume, work_dir: str, name: str,
     if os.path.exists(seg_path) and not force:
         return load_segmentation(seg_path)
 
-    ts = _ts_binary()
-    if ts is None:
-        raise RuntimeError(
-            "Local segmentation is not available in this installation "
-            "(TotalSegmentator is not installed). The full offline build ships "
-            "the segmentation runtime inside the app; this appears to be the "
-            "lean cloud build, which segments on the cloud service instead -- "
-            "make sure a segmentation server URL is configured (it is by "
-            "default) and you are online. To enable local segmentation from a "
-            "source checkout, install the optional dependencies: "
-            "pip install 'spine-hu-tool[local-seg]'.")
+    # Resolve a HEALTHY runtime (bundled -> managed -> host), health-checking
+    # each candidate once per process. Raises a structured UserFacingError with
+    # per-candidate failure reasons and a repair/cloud remedy when none works.
+    from .local_setup import resolve_runtime, ts_command
+    py, _source = resolve_runtime()
 
     in_path = os.path.join(work_dir, f"{name}.nii.gz")
     if not os.path.exists(in_path) or force:
@@ -168,10 +149,11 @@ def run_segmentation(volume: Volume, work_dir: str, name: str,
     # Device is configurable so the same code runs on a CPU or a GPU server
     # (set SPINE_HU_DEVICE=gpu on a GPU-backed deployment).
     device = os.environ.get("SPINE_HU_DEVICE", "cpu")
-    cmd = [ts, "-i", in_path, "-o", seg_path, "--ml",
-           "--device", device, "-nr", str(threads), "-ns", "1", "--quiet"]
+    ts_args = ["-i", in_path, "-o", seg_path, "--ml",
+               "--device", device, "-nr", str(threads), "-ns", "1", "--quiet"]
     if fast:
-        cmd.append("--fast")
+        ts_args.append("--fast")
+    cmd = ts_command(py, *ts_args)
 
     # IMPORTANT: log to a file, not a PIPE. nnU-Net spawns worker processes that
     # inherit the stdout/stderr handles; with a PIPE, subprocess.run() blocks on
@@ -187,11 +169,38 @@ def run_segmentation(volume: Volume, work_dir: str, name: str,
         if os.path.exists(alt):
             return load_segmentation(alt)
         try:
-            tail = open(log_path).read()[-800:]
+            tail = open(log_path).read()[-2000:]
         except OSError:
             tail = ""
-        raise RuntimeError(
-            "TotalSegmentator failed.\n"
-            f"command: {' '.join(cmd)}\n"
-            f"log (tail): {tail}")
+        raise _seg_failure_error(cmd, proc.returncode, tail, log_path)
     return load_segmentation(seg_path)
+
+
+def _seg_failure_error(cmd, returncode, log_tail: str, log_path: str):
+    """Build the structured error for a TotalSegmentator crash, calling out the
+    most common real cause (out of memory) when the evidence supports it."""
+    from ..errors import UserFacingError
+    low = log_tail.lower()
+    # A negative return code is the signal number that killed the process; the
+    # OOM killer sends SIGKILL (-9). MemoryError / allocator messages cover the
+    # in-Python variants.
+    oom = (returncode == -9 or "memoryerror" in low or "out of memory" in low
+           or "cannot allocate memory" in low or "defaultcpuallocator" in low)
+    detail = (f"exit code: {returncode}\n"
+              f"command: {' '.join(cmd)}\n"
+              f"full log: {log_path}\n"
+              f"log (tail):\n{log_tail}")
+    if oom:
+        return UserFacingError(
+            title="Segmentation ran out of memory",
+            message="Segmentation failed on this computer. This scan may be "
+                    "too large for this computer's memory.",
+            remedy="Click 'Use cloud instead' to rerun now, or try again with "
+                   "the Fast (3 mm, low memory) resolution.",
+            detail=detail, kind="seg-oom")
+    return UserFacingError(
+        title="Segmentation failed",
+        message="Segmentation failed on this computer.",
+        remedy="Click 'Use cloud instead' to rerun now, or 'Repair local "
+               "segmentation' if this keeps happening.",
+        detail=detail, kind="seg-crashed")

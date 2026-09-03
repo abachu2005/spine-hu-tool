@@ -196,6 +196,20 @@ jobs:
           mkdir -p artifacts
           mv packaging/dist/SpineHUTool-x86_64.AppImage artifacts/SpineHUTool-linux-x86_64.AppImage
 
+      # Gate the release on the bundled runtime working OFF the build machine:
+      # verify_build.py health-checks the runtime in situ, then copies it to a
+      # temp path containing spaces with uv's python store hidden and re-checks
+      # (catches non-relocatable bundles like v0.2.0, which passed in situ).
+      - name: Verify offline bundle (simulated user machine)
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            APP="packaging/dist/Spine HU Tool.app"
+          else
+            APP="packaging/dist/Spine HU Tool"
+          fi
+          python packaging/verify_build.py --app "$APP"
+
       # Publish this OS's installer straight to GCS. The offline installers are
       # multi-GB -- far too large for GitHub's artifact storage (it hits the
       # account quota) or a GitHub Release (2 GB/file limit) -- so each build job

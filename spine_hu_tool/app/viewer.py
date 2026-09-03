@@ -16,7 +16,9 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .review_state import ReviewState
 from .analysis import analyze_dataset
+from . import applog
 from . import run_store
+from ..errors import UserFacingError
 from ..roi.modes import DEFAULT_MODE, EXPOSED_MODES, MODE_LABELS
 from ..segmentation.backends import resolve_seg_url
 from ..segmentation.totalseg_runner import local_seg_available
@@ -140,7 +142,7 @@ class PlaneView(pg.GraphicsLayoutWidget):
 class AnalyzeWorker(QtCore.QThread):
     progress = QtCore.Signal(str, float)
     finished_state = QtCore.Signal(object)
-    failed = QtCore.Signal(str)
+    failed = QtCore.Signal(object)          # carries the exception object
 
     def __init__(self, folder, series, mode, reviewer, seg_url=None, api_key=None,
                  local=False, fast=None, scout=True):
@@ -159,7 +161,8 @@ class AnalyzeWorker(QtCore.QThread):
                                  progress=lambda m, f: self.progress.emit(m, f))
             self.finished_state.emit(st)
         except Exception as e:  # surfaced to the user
-            self.failed.emit(str(e))
+            applog.log_exception("analysis failed", e)
+            self.failed.emit(e)
 
 
 class BatchWorker(QtCore.QThread):
@@ -221,23 +224,32 @@ class BatchWorker(QtCore.QThread):
             self.progress.emit("Batch complete.", 1.0)
             self.finished_batch.emit(self.batch_id)
         except Exception as e:  # unexpected: surface it
-            self.failed.emit(str(e))
+            applog.log_exception("batch analysis failed", e)
+            self.failed.emit(e)
 
 
 class SetupWorker(QtCore.QThread):
-    """Installs the local-segmentation runtime (torch + TotalSegmentator +
-    weights) off the UI thread, streaming progress lines."""
+    """Installs (or repairs) the local-segmentation runtime (torch +
+    TotalSegmentator + weights) off the UI thread, streaming progress lines."""
     progress = QtCore.Signal(str)
     done = QtCore.Signal()
-    failed = QtCore.Signal(str)
+    failed = QtCore.Signal(object)          # carries the exception object
+
+    def __init__(self, repair: bool = False):
+        super().__init__()
+        self.repair = repair
 
     def run(self):
+        from ..segmentation.local_setup import (
+            classify_setup_error, repair_local_seg, setup_local_seg)
         try:
-            from ..segmentation.local_setup import setup_local_seg
-            setup_local_seg(progress=lambda m: self.progress.emit(m))
+            fn = repair_local_seg if self.repair else setup_local_seg
+            fn(progress=lambda m: self.progress.emit(m))
             self.done.emit()
         except Exception as e:  # surfaced to the user
-            self.failed.emit(str(e))
+            applog.log_exception(
+                "local-seg repair failed" if self.repair else "local-seg setup failed", e)
+            self.failed.emit(classify_setup_error(e))
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -280,11 +292,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "validated diagnostic device.\n\n"
             "By default, segmentation runs on a shared cloud service: the "
             "scans you open are uploaded to that hosted service for "
-            "processing. When using the cloud, do NOT upload protected health "
-            "information (PHI) — use de-identified data only.\n\n"
-            "To keep scans on this computer, check \u201cRun segmentation on "
-            "this computer (no upload)\u201d on the next screen — nothing "
-            "leaves your machine in that mode.\n\n"
+            "processing. Do NOT use protected health information (PHI) — "
+            "use de-identified data only.\n\n"
+            "All runs — including runs where segmentation is computed on "
+            "this computer — are archived to the hosted service (inputs, "
+            "outputs, and logs) for quality assurance, record keeping, and "
+            "troubleshooting.\n\n"
             "By continuing you confirm you understand and accept these terms.")
         agree = box.addButton("I understand and accept", QtWidgets.QMessageBox.AcceptRole)
         box.addButton("Quit", QtWidgets.QMessageBox.RejectRole)
@@ -332,14 +345,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seg_url_edit.setPlaceholderText("Segmentation server URL (cloud default)")
         # Local segmentation toggle: when checked, the heavy TotalSegmentator step
         # runs on this machine instead of the cloud service (requires the optional
-        # local-seg dependencies / TotalSegmentator to be installed).
+        # local-seg dependencies / TotalSegmentator to be installed). NOTE: this
+        # is compute-location wording only -- every run (local or cloud) is
+        # archived to the hosted service for QA/troubleshooting, so it must NOT
+        # promise "no upload".
         self.local_seg_cb = QtWidgets.QCheckBox(
-            "Run segmentation on this computer (no upload)")
+            "Run segmentation on this computer")
         self.local_seg_cb.setToolTip(
-            "Process the scan locally instead of the cloud service, so nothing "
-            "is uploaded. The offline build has everything it needs built in; "
-            "otherwise use \u201cSet up local segmentation\u201d once. Full-res "
-            "needs more RAM \u2014 pick Fast on a low-memory machine.")
+            "Compute the segmentation locally instead of on the cloud service. "
+            "The offline build has everything it needs built in; otherwise use "
+            "\u201cSet up local segmentation\u201d once. Full-res needs more "
+            "RAM \u2014 pick Fast on a low-memory machine. Note: run data is "
+            "still archived to the hosted service for quality assurance and "
+            "troubleshooting.")
         self.local_seg_cb.toggled.connect(self._on_local_toggled)
         # Segmentation resolution: full-res (1.5 mm, matches cloud, best ROI
         # placement) vs fast (3 mm, much lighter on RAM). Full-res is the
@@ -743,11 +761,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_local_seg_state()
         self.local_seg_cb.setChecked(True)
 
-    def _on_setup_failed(self, msg):
+    def _on_setup_failed(self, err):
         self.progress.setVisible(False); self.progress.setRange(0, 100)
         self.setup_local_btn.setEnabled(True)
         self.status_lbl.setText("Local setup failed.")
-        QtWidgets.QMessageBox.critical(self, "Local setup failed", msg)
+        self._show_error_dialog(err)
 
     def start_analyze(self):
         studies = self._checked_studies()
@@ -764,6 +782,10 @@ class MainWindow(QtWidgets.QMainWindow):
         fast = bool(self.res_combo.currentData())   # may have changed in the dialog
         seg_url = self.seg_url_edit.text().strip() or None
         mode = self.roi_mode_combo.currentData() or DEFAULT_MODE
+        # Remember the request so failure dialogs can offer one-click
+        # "Use cloud instead" / "Try again" reruns.
+        self._retry_ctx = {"studies": studies, "mode": mode, "seg_url": seg_url,
+                           "local": local, "fast": fast}
         self.progress.setVisible(True); self.analyze_btn.setEnabled(False)
 
         if len(studies) == 1:
@@ -839,9 +861,98 @@ class MainWindow(QtWidgets.QMainWindow):
             self.progress.setValue(int(frac * 100))
         self.status_lbl.setText(msg)
 
-    def _on_failed(self, msg):
+    def _on_failed(self, err):
         self.analyze_btn.setEnabled(True)
-        QtWidgets.QMessageBox.critical(self, "Analysis failed", msg)
+        self.progress.setVisible(False)
+        self.progress.setRange(0, 100)
+        self.status_lbl.setText("Analysis failed.")
+        self._show_error_dialog(err)
+
+    # ---- structured error dialogs ----------------------------------------
+    #
+    # Every failure dialog has three layers: WHAT HAPPENED in plain language,
+    # WHAT TO DO NOW (with live buttons when the app can do it itself), and a
+    # "Show Details" expander with the technical detail + log path -- never a
+    # raw traceback or command line as the headline.
+
+    # kinds where "Repair local segmentation" / "Use cloud instead" make sense
+    _LOCAL_KINDS = ("local-runtime-broken", "seg-crashed", "seg-oom", "setup-failed")
+    _CLOUD_RETRY_KINDS = ("cloud-unreachable", "cloud-timeout", "cloud-failed")
+
+    def _show_error_dialog(self, err):
+        import traceback
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Critical)
+        if isinstance(err, UserFacingError):
+            kind = err.kind
+            box.setWindowTitle(err.title)
+            box.setText(err.message)
+            if err.remedy:
+                box.setInformativeText(err.remedy)
+            detail = err.detail
+        else:
+            kind = "unknown"
+            box.setWindowTitle("Something went wrong")
+            box.setText("Something went wrong that the app didn't anticipate.")
+            box.setInformativeText(
+                "Please try again. If it keeps happening, send us the log "
+                f"file at:\n{applog.log_path()}")
+            if isinstance(err, BaseException):
+                detail = "".join(traceback.format_exception(err))
+            else:
+                detail = str(err)
+        box.setDetailedText(f"{detail}\n\nLog file: {applog.log_path()}")
+
+        can_rerun = bool(getattr(self, "_retry_ctx", None))
+        repair_btn = cloud_btn = retry_btn = None
+        if kind in self._LOCAL_KINDS:
+            repair_btn = box.addButton("Repair local segmentation",
+                                       QtWidgets.QMessageBox.ActionRole)
+            if can_rerun:
+                cloud_btn = box.addButton("Use cloud instead",
+                                          QtWidgets.QMessageBox.AcceptRole)
+        elif kind in self._CLOUD_RETRY_KINDS and can_rerun:
+            retry_btn = box.addButton("Try again",
+                                      QtWidgets.QMessageBox.AcceptRole)
+        box.addButton(QtWidgets.QMessageBox.Close)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is not None and clicked is repair_btn:
+            self._start_repair()
+        elif clicked is not None and clicked is cloud_btn:
+            self._rerun_analysis(local=False)
+        elif clicked is not None and clicked is retry_btn:
+            self._rerun_analysis()
+
+    def _start_repair(self):
+        """Rebuild the managed local-seg env (the zero-argument 'fix it' path)."""
+        self.stack.setCurrentIndex(0)
+        self.setup_local_btn.setEnabled(False)
+        self.progress.setVisible(True); self.progress.setRange(0, 0)
+        self.status_lbl.setText("Repairing local segmentation...")
+        self.setup_worker = SetupWorker(repair=True)
+        self.setup_worker.progress.connect(lambda m: self.status_lbl.setText(m))
+        self.setup_worker.done.connect(self._on_setup_done)
+        self.setup_worker.failed.connect(self._on_setup_failed)
+        self.setup_worker.start()
+
+    def _rerun_analysis(self, local=None):
+        """Re-run the last requested analysis, optionally forcing the cloud."""
+        ctx = getattr(self, "_retry_ctx", None)
+        if not ctx:
+            return
+        use_local = ctx["local"] if local is None else local
+        if not use_local:
+            self.local_seg_cb.setChecked(False)   # keep the UI honest
+        self.stack.setCurrentIndex(0)
+        self.progress.setVisible(True); self.analyze_btn.setEnabled(False)
+        studies, mode = ctx["studies"], ctx["mode"]
+        if len(studies) == 1:
+            self._start_single(studies[0], mode, ctx["seg_url"], use_local,
+                               ctx["fast"])
+        else:
+            self._start_batch(studies, mode, ctx["seg_url"], use_local,
+                              ctx["fast"])
 
     def _on_analyzed(self, state):
         self.analyze_btn.setEnabled(True)
@@ -1182,7 +1293,8 @@ class MainWindow(QtWidgets.QMainWindow):
             rec["export_dir"] = export_dir
             run_store.save_run(rec)
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Finalize failed", str(e))
+            applog.log_exception("finalize failed", e)
+            self._show_error_dialog(e)
             return
         QtWidgets.QMessageBox.information(
             self, "Run finalized",
@@ -1222,6 +1334,7 @@ def _app_icon():
 
 def main():
     import sys
+    applog.init_logging()
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("Spine HU Tool")
     icon = _app_icon()

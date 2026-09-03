@@ -48,8 +48,6 @@ def test_bundled_env_discovery_via_meipass(monkeypatch, tmp_path):
     envdir = tmp_path / "localseg-env"
     bindir = envdir / ("Scripts" if sys.platform.startswith("win") else "bin")
     bindir.mkdir(parents=True)
-    ts_name = "TotalSegmentator" + (".exe" if sys.platform.startswith("win") else "")
-    (bindir / ts_name).write_text("#!/bin/sh\n")
     weights = tmp_path / "totalseg-weights"
     weights.mkdir()
 
@@ -58,7 +56,6 @@ def test_bundled_env_discovery_via_meipass(monkeypatch, tmp_path):
     monkeypatch.delenv("SPINE_HU_BUNDLED_WEIGHTS", raising=False)
 
     assert ls.bundled_env_dir() == str(envdir)
-    assert ls.bundled_ts_binary() == str(bindir / ts_name)
     assert ls.bundled_weights_dir() == str(weights)
     assert ls.weights_home() == str(weights)
 
@@ -72,32 +69,140 @@ def test_bundled_env_overrides(monkeypatch, tmp_path):
     assert ls.bundled_env_dir() is None
 
 
-def test_ts_binary_prefers_bundled(monkeypatch, tmp_path):
-    fake = str(tmp_path / "bin" / "TotalSegmentator")
-    monkeypatch.setattr(ls, "bundled_ts_binary", lambda: fake)
-    assert tr._ts_binary() == fake
+def _make_fake_python(path):
+    """Create a fake interpreter file (executable on POSIX)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n")
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_find_runtime_python_standalone_layout(tmp_path):
+    # uv installs python-build-standalone at <env>/cpython-<ver>-<platform>/
+    envdir = tmp_path / "localseg-env"
+    if sys.platform.startswith("win"):
+        py = _make_fake_python(
+            envdir / "cpython-3.11.9-windows-x86_64-none" / "python.exe")
+    else:
+        py = _make_fake_python(
+            envdir / "cpython-3.11.9-macos-aarch64-none" / "bin" / "python3.11")
+    assert ls.find_runtime_python(str(envdir)) == py
+
+
+def test_find_runtime_python_venv_layout(tmp_path):
+    # legacy venv layout (the managed env)
+    envdir = tmp_path / "env"
+    if sys.platform.startswith("win"):
+        py = _make_fake_python(envdir / "Scripts" / "python.exe")
+    else:
+        py = _make_fake_python(envdir / "bin" / "python3")
+    assert ls.find_runtime_python(str(envdir)) == py
+
+
+def test_find_runtime_python_missing(tmp_path):
+    assert ls.find_runtime_python(str(tmp_path)) is None
+    assert ls.find_runtime_python(None) is None
+
+
+def test_runtime_candidates_order_and_availability(monkeypatch):
+    monkeypatch.setattr(ls, "bundled_python", lambda: "/bundle/py")
+    monkeypatch.setattr(ls, "managed_python", lambda: "/managed/py")
+    cands = ls.runtime_candidates()
+    assert cands[0] == ("bundled", "/bundle/py")
+    assert cands[1] == ("managed", "/managed/py")
     assert tr.local_seg_available() is True
 
 
-def test_ts_binary_none_when_nothing_available(monkeypatch):
-    import shutil
-    monkeypatch.setattr(ls, "bundled_ts_binary", lambda: None)
-    monkeypatch.setattr(ls, "managed_ts_binary", lambda: None)
-    monkeypatch.setattr(shutil, "which", lambda _n: None)
-    # no TotalSegmentator sitting next to this interpreter
-    real_exists = os.path.exists
+def test_no_runtime_available(monkeypatch):
+    import importlib.util
+    monkeypatch.setattr(ls, "bundled_python", lambda: None)
+    monkeypatch.setattr(ls, "managed_python", lambda: None)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _n: None)
+    assert ls.runtime_candidates() == []
+    assert tr._ts_python() is None
+    assert tr.local_seg_available() is False
+
+
+# --- runtime health check (verify_runtime) -----------------------------------
+
+def test_verify_runtime_missing_interpreter():
+    ok, reason = ls.verify_runtime("/no/such/python", use_cache=False)
+    assert not ok and "not found" in reason
+
+
+def test_verify_runtime_broken_runtime_captures_reason(tmp_path):
+    # A runtime whose imports fail: health check must fail and carry the
+    # import error as the reason. (A stub interpreter keeps this deterministic
+    # regardless of whether the test venv has torch installed.)
+    import pytest
+    if sys.platform.startswith("win"):
+        pytest.skip("POSIX stub interpreter")
+    fake = tmp_path / "python"
+    fake.write_text("#!/bin/sh\n"
+                    "echo \"ModuleNotFoundError: No module named 'torch'\" >&2\n"
+                    "exit 1\n")
+    fake.chmod(0o755)
+    ok, reason = ls.verify_runtime(str(fake), use_cache=False)
+    assert not ok
+    assert "ModuleNotFoundError" in reason
+
+
+def test_verify_runtime_caches(monkeypatch):
+    calls = {"n": 0}
+
+    class _R:
+        returncode = 0
+        stdout = stderr = ""
+
+    def _fake_run(*a, **k):
+        calls["n"] += 1
+        return _R()
+
+    ls.clear_verify_cache()
+    monkeypatch.setattr(ls.subprocess, "run", _fake_run)
+    monkeypatch.setattr(ls.os.path, "exists", lambda _p: True)
+    assert ls.verify_runtime("/fake/py")[0] is True
+    assert ls.verify_runtime("/fake/py")[0] is True
+    assert calls["n"] == 1
+    ls.clear_verify_cache()
+
+
+def test_resolve_runtime_error_names_paths_and_overrides(monkeypatch):
+    from spine_hu_tool.errors import UserFacingError
+    ls.clear_verify_cache()
+    monkeypatch.setattr(ls, "bundled_python", lambda: "/broken/bundled/py")
+    monkeypatch.setattr(ls, "managed_python", lambda: None)
+    monkeypatch.setattr(ls, "verify_runtime",
+                        lambda py, **k: (False, "ImportError: no torch"))
+    monkeypatch.setenv("SPINE_HU_BUNDLED_ENV", "/broken/bundled")
+    import pytest
+    with pytest.raises(UserFacingError) as ei:
+        ls.resolve_runtime()
+    err = ei.value
+    assert err.kind == "local-runtime-broken"
+    assert "/broken/bundled/py" in err.detail
+    assert "SPINE_HU_BUNDLED_ENV" in err.detail       # override flagged
+    assert "Repair" in err.remedy and "cloud" in err.remedy
+
+
+def test_resolve_runtime_prefers_first_healthy(monkeypatch):
+    ls.clear_verify_cache()
+    monkeypatch.setattr(ls, "bundled_python", lambda: "/broken/bundled/py")
+    monkeypatch.setattr(ls, "managed_python", lambda: "/healthy/managed/py")
     monkeypatch.setattr(
-        os.path, "exists",
-        lambda p: False if str(p).endswith("TotalSegmentator") else real_exists(p))
-    assert tr._ts_binary() is None
+        ls, "verify_runtime",
+        lambda py, **k: (py == "/healthy/managed/py", "boom"))
+    py, source = ls.resolve_runtime()
+    assert py == "/healthy/managed/py" and source == "managed"
 
 
-# --- run_segmentation builds a sanitized env + weights, never launches -------
+# --- run_segmentation builds a sanitized env + python -c command, never launches
 
 def test_run_segmentation_env_and_command(monkeypatch, tmp_path):
     """run_segmentation must build a sanitized env with TOTALSEG_HOME_DIR and a
-    valid command -- captured via a fake subprocess so nothing is executed."""
-    monkeypatch.setattr(tr, "_ts_binary", lambda: "/fake/TotalSegmentator")
+    python -c command (NEVER a console-script trampoline) -- captured via a fake
+    subprocess so nothing is executed."""
+    monkeypatch.setattr(ls, "resolve_runtime", lambda: ("/fake/env/python", "bundled"))
     monkeypatch.setattr(ls, "weights_home", lambda: "/bundled/weights")
     monkeypatch.setenv("DYLD_LIBRARY_PATH", "/frozen/leak")
 
@@ -128,8 +233,27 @@ def test_run_segmentation_env_and_command(monkeypatch, tmp_path):
     assert env["TOTALSEG_HOME_DIR"] == "/bundled/weights"
     assert env["TOTALSEG_WEIGHTS_PATH"] == "/bundled/weights"
     assert "DYLD_LIBRARY_PATH" not in env, "frozen loader var leaked into TS env"
-    assert "--fast" in captured["cmd"]
-    assert captured["cmd"][0] == "/fake/TotalSegmentator"
+    cmd = captured["cmd"]
+    assert "--fast" in cmd
+    # invoked through the runtime's python -c entry, immune to trampolines
+    assert cmd[0] == "/fake/env/python"
+    assert cmd[1] == "-c" and "TotalSegmentator" in cmd[2]
+    assert not any(str(c).endswith(("TotalSegmentator", "TotalSegmentator.exe"))
+                   for c in cmd)
+
+
+def test_seg_failure_error_flags_oom(tmp_path):
+    from spine_hu_tool.errors import UserFacingError
+    err = tr._seg_failure_error(["python", "-c", "x"], -9, "worker killed",
+                                str(tmp_path / "seg.log"))
+    assert isinstance(err, UserFacingError)
+    assert err.kind == "seg-oom"
+    assert "memory" in err.message.lower()
+
+    err = tr._seg_failure_error(["python", "-c", "x"], 1, "RuntimeError: boom",
+                                str(tmp_path / "seg.log"))
+    assert err.kind == "seg-crashed"
+    assert "cloud" in err.remedy.lower()
 
 
 # --- RAM guard --------------------------------------------------------------
@@ -169,12 +293,16 @@ def test_analyze_local_defaults_to_fullres(monkeypatch):
         captured["local"] = local
         return np.zeros((2, 2, 2), dtype=np.int16)
 
+    class _State:
+        case = {}
+        volume = None
+
     monkeypatch.setattr(analysis, "segment", _fake_segment)
     monkeypatch.setattr(analysis, "load_series",
                         lambda files, metadata=None: Volume(
                             hu=np.zeros((4, 4, 4), np.int16), spacing=(1.0, 1.0, 1.0)))
     monkeypatch.setattr(analysis.ReviewState, "from_volume",
-                        classmethod(lambda cls, *a, **k: "STATE"))
+                        classmethod(lambda cls, *a, **k: _State()))
 
     class _Series:
         series_uid = "1.2.3"

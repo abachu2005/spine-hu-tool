@@ -1,6 +1,9 @@
 import os
 import pytest
 
+# Tests must be hermetic: never archive test runs to the real cloud bucket.
+os.environ.setdefault("SPINE_HU_NO_ARCHIVE", "1")
+
 # project root = three levels up from this file
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 

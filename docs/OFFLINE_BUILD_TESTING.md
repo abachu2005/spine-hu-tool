@@ -40,7 +40,7 @@ For every target — **macOS (Apple Silicon)**, **macOS (Intel)**, **Windows**,
    - Linux: `chmod +x` the AppImage, then run it.
 3. Turn OFF networking (airplane mode / pull the cable) to prove offline.
 4. Open a de-identified DICOM study.
-5. Check **Run segmentation on this computer (no upload)**.
+5. Check **Run segmentation on this computer**.
 6. Leave resolution on **Full resolution** on a strong machine; on an 8 GB
    laptop confirm the **low-memory warning** appears and "Use fast instead"
    works.

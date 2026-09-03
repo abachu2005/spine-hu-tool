@@ -63,8 +63,7 @@ dropped to **~7 HU**, and fully-imaged overlapping levels agree within
 
 Download a ready-to-run installer (no Python needed). The full offline build
 bundles the segmentation runtime + model weights, so it segments **on your
-computer with zero setup** (nothing is uploaded); a cloud option is also
-available.
+computer with zero setup**; a cloud option is also available.
 
 **Download page:** https://storage.googleapis.com/spine-hu-tool-downloads/index.html
 
@@ -73,10 +72,14 @@ available.
 - **Windows**: run the setup wizard. On SmartScreen: **More info → Run anyway**.
 - **Linux**: `chmod +x` the AppImage and run it.
 
-To keep scans on your machine, check **Run segmentation on this computer (no
-upload)**. Full resolution is the default; on a low-memory machine the app warns
-and offers **Fast (3 mm)**. You can analyze one study, several at once, or all
-studies in a folder, and reopen past runs from **View past runs**.
+To compute segmentation on your machine, check **Run segmentation on this
+computer**. Full resolution is the default; on a low-memory machine the app
+warns and offers **Fast (3 mm)**. You can analyze one study, several at once, or
+all studies in a folder, and reopen past runs from **View past runs**.
+
+Note: all runs — local or cloud — are archived (inputs, outputs, and logs) to
+the hosted service for QA, record keeping, and troubleshooting; use
+de-identified data only. `SPINE_HU_NO_ARCHIVE=1` disables archival (dev/test).
 
 > Pilot / research use only — not a validated diagnostic device. In the optional
 > cloud mode, scans are uploaded to a shared service, so use de-identified data

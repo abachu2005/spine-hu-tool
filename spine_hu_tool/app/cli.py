@@ -225,6 +225,8 @@ def build_parser():
 
 
 def main(argv=None):
+    from .applog import init_logging
+    init_logging(verbose_console=False)
     args = build_parser().parse_args(argv)
     return args.func(args)
 

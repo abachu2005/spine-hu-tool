@@ -1,25 +1,38 @@
 """Build the self-contained local-segmentation runtime bundled in the installer.
 
 The full offline desktop build ships a prebuilt Python + PyTorch +
-TotalSegmentator environment *and* the pretrained model weights inside the app
-so a user can segment locally with zero setup (no download, works offline).
+TotalSegmentator runtime *and* the pretrained model weights inside the app so a
+user can segment locally with zero setup (no download, works offline).
 
-This script creates that runtime next to (or inside) the PyInstaller output. It
-reuses :func:`spine_hu_tool.segmentation.local_setup.provision_env`, so the
-runtime is identical to the one the on-demand installer would build -- just
-produced ahead of time by CI and copied into the bundle.
+RELOCATABILITY IS THE WHOLE POINT. The runtime is built on a CI runner but runs
+from wherever the installer puts it ("C:\\Program Files\\Spine HU Tool", a
+path with spaces, on a machine with no Python). A virtualenv can NEVER be
+shipped this way: its ``pyvenv.cfg`` points at the base interpreter on the
+build machine (which is not shipped) and its console-script executables embed
+absolute build paths -- that was the v0.2.0 bug ("uv trampoline failed to
+canonicalize script path" on every fresh install). So instead this script:
+
+  1. installs a STANDALONE CPython (python-build-standalone via uv, relocatable
+     by design) directly inside the bundle, and
+  2. pip-installs torch + TotalSegmentator straight into that interpreter's own
+     site-packages -- no venv, no ``pyvenv.cfg``, no console-script trampolines.
+
+The app never runs any console script from the runtime; it invokes
+``<bundled python> -c "...TotalSegmentator main..."`` (see
+spine_hu_tool.segmentation.local_setup.ts_command), which no relocation can
+break.
 
 Usage (run in CI / on a build machine per OS -- NOT on a low-RAM dev laptop):
 
     python packaging/build_localseg_env.py --out packaging/localseg-bundle
 
 Produces:
-    <out>/localseg-env/       # uv-managed venv with torch + TotalSegmentator
+    <out>/localseg-env/       # standalone CPython + torch + TotalSegmentator
     <out>/totalseg-weights/   # pretrained weights (full-res + fast)
 
 The PyInstaller spec / per-OS packagers copy these two directories next to the
 frozen app (see packaging/spine_hu.spec). At runtime the app discovers them via
-spine_hu_tool.segmentation.local_setup.bundled_env_dir / bundled_weights_dir.
+spine_hu_tool.segmentation.local_setup.bundled_env_dir / bundled_python.
 
 IMPORTANT: this downloads/installs multi-GB packages and weights and must run on
 a machine that can handle it. It never runs segmentation inference itself.
@@ -32,11 +45,60 @@ import sys
 # Make the package importable when run from a source checkout.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from spine_hu_tool.segmentation.local_setup import provision_env  # noqa: E402
+from spine_hu_tool.segmentation import local_setup as ls  # noqa: E402
 
 
 def _progress(msg: str) -> None:
     print(f"[build-localseg] {msg}", flush=True)
+
+
+def provision_standalone_runtime(env_dir: str, *, weights_dir: str,
+                                 weight_tasks=("total", "total_fast"),
+                                 progress=None,
+                                 weights_fatal: bool = True) -> str:
+    """Install a relocatable standalone CPython + ML stack into ``env_dir``.
+
+    Returns the bundled interpreter path. Unlike
+    :func:`local_setup.provision_env` (a venv for the in-place managed env),
+    everything here lives inside ``env_dir`` itself and survives being copied
+    to any path on any machine.
+    """
+    uv = ls._ensure_uv(progress)
+    os.makedirs(env_dir, exist_ok=True)
+
+    # 1. Standalone CPython (python-build-standalone) extracted INTO the bundle.
+    #    UV_PYTHON_INSTALL_DIR redirects uv's managed-python store to env_dir, so
+    #    the interpreter lands at <env_dir>/cpython-<ver>-<platform>/.
+    ls._run([uv, "python", "install", ls._MANAGED_PY], progress,
+            "Installing standalone CPython into the bundle...",
+            env=ls.child_env({"UV_PYTHON_INSTALL_DIR": env_dir}))
+    py = ls.find_runtime_python(env_dir)
+    if py is None:
+        raise RuntimeError(f"No interpreter found under {env_dir} after "
+                           "'uv python install'.")
+
+    # 2. Packages straight into the standalone interpreter's site-packages.
+    #    Plain pip (bootstrapped by the bundled ensurepip) keeps uv's venv
+    #    machinery entirely out of the shipped artifact.
+    ls._run([py, "-m", "ensurepip", "--upgrade"], progress,
+            "Bootstrapping pip in the bundled Python...")
+    pip = [py, "-m", "pip", "install", "--no-warn-script-location"]
+    # CPU torch (the cloud handles GPU). On Linux/Windows the default index
+    # ships large CUDA wheels, so pin the CPU index there; macOS wheels are
+    # CPU/MPS already.
+    if sys.platform.startswith(("win", "linux")):
+        ls._run([*pip, "torch", "--index-url",
+                 "https://download.pytorch.org/whl/cpu"], progress,
+                "Installing PyTorch (CPU)... this can take several minutes.")
+    else:
+        ls._run([*pip, "torch"], progress,
+                "Installing PyTorch... this can take several minutes.")
+    ls._run([*pip, "TotalSegmentator"], progress,
+            "Installing TotalSegmentator...")
+
+    # 3. Pretrained weights, fetched through the bundled interpreter itself.
+    ls._download_weights(py, weights_dir, weight_tasks, progress, weights_fatal)
+    return py
 
 
 def _slim_env(env_dir: str) -> None:
@@ -96,13 +158,19 @@ def main(argv=None) -> int:
     weights_dir = os.path.join(out, "totalseg-weights")
     os.makedirs(out, exist_ok=True)
 
-    _progress(f"Building local-seg env at {env_dir}")
+    _progress(f"Building relocatable local-seg runtime at {env_dir}")
     _progress(f"Weights -> {weights_dir} (tasks: {', '.join(args.tasks)})")
-    ts = provision_env(env_dir, weights_dir=weights_dir,
-                       weight_tasks=tuple(args.tasks), progress=_progress,
-                       weights_fatal=not args.best_effort_weights)
+    py = provision_standalone_runtime(
+        env_dir, weights_dir=weights_dir, weight_tasks=tuple(args.tasks),
+        progress=_progress, weights_fatal=not args.best_effort_weights)
     _slim_env(env_dir)
-    _progress(f"Done. TotalSegmentator: {ts}")
+
+    # In-situ health check (the relocation check runs in verify_build.py).
+    ok, reason = ls.verify_runtime(py, use_cache=False)
+    if not ok:
+        _progress(f"ERROR: built runtime failed its health check:\n{reason}")
+        return 1
+    _progress(f"Done. Bundled Python: {py}")
 
     # Sanity: weights dir must be non-empty when weights are required.
     if not args.best_effort_weights:
