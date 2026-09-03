@@ -17,6 +17,7 @@ Python + ML stack with streamed progress, and reporting readiness.
 """
 from __future__ import annotations
 import os
+import re
 import sys
 import platform
 import shutil
@@ -106,6 +107,58 @@ def _managed_uv_path() -> str:
     return os.path.join(_user_data_root(), "bin", _exe("uv"))
 
 
+def _uv_dirs() -> dict:
+    """uv state dirs pinned inside our per-user LOCAL data dir.
+
+    By default uv keeps its managed Pythons in the *roaming* profile
+    (``%APPDATA%\\uv``) and reaches them through a minor-version directory
+    junction. On managed / OneDrive-synced Windows machines the filesystem
+    filter marks that junction untrusted, after which every traversal fails
+    with os error 448 ("The path cannot be traversed because it contains an
+    untrusted mount point") -- this broke local setup on a pilot machine.
+    Pinning uv's data/cache/python dirs into our own LOCALAPPDATA folder
+    (never roamed or cloud-synced) sidesteps the poisoned location entirely.
+    """
+    root = os.path.join(_user_data_root(), "uv")
+    return {
+        "UV_DATA_DIR": root,
+        "UV_CACHE_DIR": os.path.join(root, "cache"),
+        "UV_PYTHON_INSTALL_DIR": os.path.join(root, "python"),
+    }
+
+
+def _uv_env() -> dict:
+    env = dict(os.environ)
+    env.update(_uv_dirs())
+    return env
+
+
+def _find_installed_python() -> Optional[str]:
+    """Locate the real (fully-versioned) CPython that uv installed.
+
+    uv lays the interpreter out as ``<dir>/cpython-3.11.9-<plat>/...`` and adds
+    a ``cpython-3.11-<plat>`` minor-version *junction* beside it. That junction
+    is exactly what untrusted-mount-point hardening refuses to traverse, so we
+    resolve the real directory by name (three-component version) and never go
+    through the link.
+    """
+    install_dir = _uv_dirs()["UV_PYTHON_INSTALL_DIR"]
+    if not os.path.isdir(install_dir):
+        return None
+    pat = re.compile(rf"^cpython-{re.escape(_MANAGED_PY)}\.\d+")
+    for entry in sorted(os.listdir(install_dir), reverse=True):
+        if not pat.match(entry):
+            continue
+        base = os.path.join(install_dir, entry)
+        candidates = ((os.path.join(base, "python.exe"),) if _IS_WIN else
+                      (os.path.join(base, "bin", "python3"),
+                       os.path.join(base, "bin", "python")))
+        for cand in candidates:
+            if os.path.exists(cand):
+                return cand
+    return None
+
+
 def _ensure_uv(progress: ProgressCb) -> str:
     """Return a path to a usable `uv`, downloading it if necessary."""
     existing = _managed_uv_path()
@@ -182,19 +235,33 @@ def setup_local_seg(progress: ProgressCb = None) -> str:
     # uv downloads a standalone CPython if the pinned version isn't present, so
     # this works even with no Python installed on the machine.
     if managed_python() is None:
-        # `only-managed` forces uv to use a standalone CPython it downloads,
-        # rather than any (possibly incompatible / transient) system Python --
-        # this is what makes the install reproducible on a machine with no
-        # Python at all.
-        _run([uv, "venv", env_dir, "--python", _MANAGED_PY,
-              "--python-preference", "only-managed"], progress,
-             "Creating local Python environment...")
+        # Download a standalone CPython into our own local, non-roaming dir
+        # (see _uv_dirs). On 448-hardened machines uv can exit nonzero here
+        # solely because it failed to create its minor-version junction; the
+        # interpreter itself lands fine, so tolerate the failure as long as a
+        # usable interpreter exists afterwards.
+        if _find_installed_python() is None:
+            try:
+                _run([uv, "python", "install", _MANAGED_PY], progress,
+                     "Downloading a private Python runtime...", env=_uv_env())
+            except RuntimeError:
+                if _find_installed_python() is None:
+                    raise
+        base_py = _find_installed_python()
+        if base_py is None:
+            raise RuntimeError("Could not install the private Python runtime.")
+        # Create the env from the explicit interpreter path: uv then treats it
+        # as an external interpreter and never resolves it through the managed
+        # minor-version junction that hardened machines refuse to traverse.
+        _run([uv, "venv", env_dir, "--python", base_py], progress,
+             "Creating local Python environment...", env=_uv_env())
     py = managed_python()
     if py is None:
         raise RuntimeError("Failed to create the local environment.")
 
     def _uv_pip_install(args, label):
-        _run([uv, "pip", "install", "--python", py, *args], progress, label)
+        _run([uv, "pip", "install", "--python", py, *args], progress, label,
+             env=_uv_env())
 
     # CPU torch (the cloud handles GPU). On Linux/Windows the default index ships
     # large CUDA wheels, so pin the CPU index there; macOS wheels are CPU/MPS.
