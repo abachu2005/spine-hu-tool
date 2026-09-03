@@ -9,7 +9,7 @@
 ; The PyInstaller onedir output lives in "packaging\dist\Spine HU Tool\".
 
 #define AppName "Spine HU Tool"
-#define AppVersion "0.1.3.1"
+#define AppVersion "0.1.3.2"
 #define AppPublisher "Spine HU Tool"
 #define AppExeName "Spine HU Tool.exe"
 

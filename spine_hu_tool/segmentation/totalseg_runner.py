@@ -86,8 +86,14 @@ def _ts_binary() -> Optional[str]:
     if on_path:
         return on_path
     # The app-managed local-seg environment, installed on demand by the user.
-    from .local_setup import managed_ts_binary
-    return managed_ts_binary()
+    # Require the env's Python to actually START, not merely exist on disk: a
+    # stale/orphaned env would otherwise hide the setup button and then crash
+    # every run with an opaque trampoline error.
+    from .local_setup import managed_ts_binary, env_python_ok
+    ts = managed_ts_binary()
+    if ts is not None and not env_python_ok():
+        return None
+    return ts
 
 
 def local_seg_available() -> bool:
@@ -115,12 +121,11 @@ def run_segmentation(volume: Volume, work_dir: str, name: str,
     ts = _ts_binary()
     if ts is None:
         raise RuntimeError(
-            "Local segmentation is not available in this installation "
-            "(TotalSegmentator is not installed). This build segments on the "
-            "cloud service instead -- make sure a segmentation server URL is "
-            "configured (it is by default) and you are online. To enable local "
-            "segmentation, install the optional dependencies: "
-            "pip install 'spine-hu-tool[local-seg]'.")
+            "Local segmentation is not installed (or its previous install is "
+            "broken) on this computer. To fix it: go back to the start screen "
+            "and click 'Set up local segmentation...' to (re)install it -- or "
+            "untick 'Run segmentation on this computer' to use the cloud "
+            "service instead (needs internet).")
 
     in_path = os.path.join(work_dir, f"{name}.nii.gz")
     if not os.path.exists(in_path) or force:

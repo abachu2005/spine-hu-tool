@@ -75,6 +75,41 @@ def managed_ts_binary() -> Optional[str]:
     return cand if os.path.exists(cand) else None
 
 
+_health_cache: Optional[bool] = None
+
+
+def invalidate_health_cache() -> None:
+    global _health_cache
+    _health_cache = None
+
+
+def env_python_ok() -> bool:
+    """Quick health check: can the managed env's Python actually start?
+
+    File existence is NOT enough: a leftover env whose base interpreter is
+    gone or unreachable (e.g. uv's roaming minor-version junction became
+    untrusted, or the roaming uv dir was cleaned up) still has python.exe and
+    TotalSegmentator.exe on disk, but every launch fails ("uv trampoline
+    failed to spawn Python child process: entity not found"). Spawning the
+    interpreter once (<1 s) catches that whole class of breakage. The result
+    is cached per process; (re)installing invalidates it.
+    """
+    global _health_cache
+    if _health_cache is not None:
+        return _health_cache
+    py = managed_python()
+    if py is None:
+        return False              # not cached: the env may appear later
+    try:
+        r = subprocess.run([py, "-c", "pass"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=60)
+        _health_cache = (r.returncode == 0)
+    except (OSError, subprocess.SubprocessError):
+        _health_cache = False
+    return _health_cache
+
+
 def is_ready() -> bool:
     """True if the managed local-segmentation runtime is fully installed."""
     py = managed_python()
@@ -229,6 +264,14 @@ def setup_local_seg(progress: ProgressCb = None) -> str:
         return managed_ts_binary()  # type: ignore[return-value]
 
     env_dir = managed_env_dir()
+    # Self-heal: an env that exists but is not ready is broken or half
+    # installed (orphaned base interpreter, interrupted install, ...).
+    # Re-running pip against it would fail with the same opaque errors the
+    # user is trying to escape, so rebuild it from scratch.
+    if os.path.isdir(env_dir):
+        if progress:
+            progress("Removing the previous (broken) local environment...")
+        shutil.rmtree(env_dir, ignore_errors=True)
     os.makedirs(os.path.dirname(env_dir), exist_ok=True)
     uv = _ensure_uv(progress)
 
@@ -289,6 +332,7 @@ def setup_local_seg(progress: ProgressCb = None) -> str:
 
     if progress:
         progress("Local segmentation is ready.")
+    invalidate_health_cache()
     ts = managed_ts_binary()
     if ts is None:
         raise RuntimeError("Install completed but TotalSegmentator was not found.")
