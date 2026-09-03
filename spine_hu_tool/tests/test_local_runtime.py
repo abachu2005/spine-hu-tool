@@ -196,6 +196,72 @@ def test_resolve_runtime_prefers_first_healthy(monkeypatch):
     assert py == "/healthy/managed/py" and source == "managed"
 
 
+# --- managed setup: pinned uv dirs + self-heal (the 0.1.3.x hotfix line) -----
+
+def test_uv_dirs_pinned_inside_user_data_root(monkeypatch, tmp_path):
+    # uv's default roaming-profile python dir breaks on 448-hardened Windows
+    # machines; all uv state must live under our own local data root.
+    monkeypatch.setattr(ls, "_user_data_root", lambda: str(tmp_path))
+    dirs = ls._uv_dirs()
+    for key in ("UV_DATA_DIR", "UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR"):
+        assert dirs[key].startswith(str(tmp_path)), key
+
+
+def test_uv_env_is_sanitized_and_pinned(monkeypatch, tmp_path):
+    monkeypatch.setattr(ls, "_user_data_root", lambda: str(tmp_path))
+    monkeypatch.setenv("PYTHONHOME", "/frozen/leak")
+    env = ls._uv_env()
+    assert "PYTHONHOME" not in env                    # child_env sanitization
+    assert env["UV_PYTHON_INSTALL_DIR"].startswith(str(tmp_path))
+
+
+def test_find_installed_python_uses_versioned_dir_not_alias(monkeypatch, tmp_path):
+    """Resolve the fully-versioned cpython-3.11.x dir by name; the bare
+    minor-version alias (a junction/symlink on real installs -- exactly what
+    hardened machines refuse to traverse) must never match."""
+    monkeypatch.setattr(ls, "_user_data_root", lambda: str(tmp_path))
+    install_dir = ls._uv_dirs()["UV_PYTHON_INSTALL_DIR"]
+    versioned = os.path.join(install_dir, "cpython-3.11.9-plat")
+    alias = os.path.join(install_dir, "cpython-3.11-plat")
+    for d in (versioned, alias):
+        sub = d if ls._IS_WIN else os.path.join(d, "bin")
+        os.makedirs(sub, exist_ok=True)
+        py = os.path.join(sub, "python.exe" if ls._IS_WIN else "python3")
+        with open(py, "w") as f:
+            f.write("")
+    assert ls._find_installed_python() == (
+        os.path.join(versioned, "python.exe") if ls._IS_WIN
+        else os.path.join(versioned, "bin", "python3"))
+
+
+def test_find_installed_python_none_when_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(ls, "_user_data_root", lambda: str(tmp_path))
+    assert ls._find_installed_python() is None
+
+
+def test_setup_rebuilds_broken_env_from_scratch(monkeypatch, tmp_path):
+    """A present-but-unhealthy env must be deleted before reprovisioning:
+    running pip against its orphaned interpreter would fail with the same
+    opaque errors the user is trying to escape."""
+    env_dir = tmp_path / "localseg-env"
+    env_dir.mkdir()
+    (env_dir / "stale-marker").write_text("broken leftover")
+    monkeypatch.setattr(ls, "managed_env_dir", lambda: str(env_dir))
+    monkeypatch.setattr(ls, "is_ready", lambda: False)
+    calls = {}
+
+    def fake_provision(env_dir_arg, **kw):
+        calls["env_dir"] = env_dir_arg
+        calls["existed_at_provision"] = os.path.isdir(env_dir_arg)
+        return "/fresh/py"
+
+    monkeypatch.setattr(ls, "provision_env", fake_provision)
+    monkeypatch.setattr(ls, "verify_runtime", lambda py, **k: (True, ""))
+    assert ls.setup_local_seg() == "/fresh/py"
+    assert calls["env_dir"] == str(env_dir)
+    assert calls["existed_at_provision"] is False     # rebuilt from scratch
+
+
 # --- run_segmentation builds a sanitized env + python -c command, never launches
 
 def test_run_segmentation_env_and_command(monkeypatch, tmp_path):

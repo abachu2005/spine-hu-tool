@@ -11,7 +11,7 @@
 #define AppName "Spine HU Tool"
 ; Kept in sync with spine_hu_tool.__version__ by packaging/sync_version.py
 ; (Inno Setup cannot read it directly). CI fails the build if this drifts.
-#define AppVersion "0.2.1"
+#define AppVersion "0.2.2"
 #define AppPublisher "Spine HU Tool"
 #define AppExeName "Spine HU Tool.exe"
 
