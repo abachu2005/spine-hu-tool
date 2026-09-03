@@ -47,14 +47,26 @@ def _print_summary(case):
     if cal:
         print(f"\nCalibration: factor={cal.get('factor')} "
               f"(kVp={cal.get('kvp')}, {', '.join(cal.get('notes', []))})")
-    print(f"\n{'level':6s} {'medHU':>6s} {'calHU':>6s} {'radius':>6s} "
-          f"{'QC':>9s}  context")
-    print("-" * 56)
+    scout = case.get("scout") or {}
+    has_habitus = bool(scout.get("levels"))
+    if scout and not scout.get("available"):
+        for w in scout.get("warnings", []):
+            print(f"\nScout: {w}")
+    hab_head = f" {'LRmm':>6s} {'APmm':>6s}" if has_habitus else ""
+    print(f"\n{'level':6s} {'medHU':>6s} {'calHU':>6s} {'radius':>6s}"
+          f"{hab_head} {'QC':>9s}  context")
+    print("-" * (56 + len(hab_head)))
     for lvl, r in case["results"].items():
         s = r.stats
+        hab = ""
+        if has_habitus:
+            w = s.get("body_width_lr_mm")
+            d = s.get("body_depth_ap_mm")
+            hab = (f" {w:6.1f}" if w is not None else f" {'-':>6s}") + \
+                  (f" {d:6.1f}" if d is not None else f" {'-':>6s}")
         print(f"{lvl:6s} {s.get('median_HU', float('nan')) or float('nan'):6.1f} "
               f"{s.get('calibrated_median_HU', float('nan')) or float('nan'):6.1f} "
-              f"{r.radius_mm:6.1f} {r.qc.get('qc_status'):>9s}  "
+              f"{r.radius_mm:6.1f}{hab} {r.qc.get('qc_status'):>9s}  "
               f"{s.get('hu_context') or ''}")
 
 
@@ -70,6 +82,7 @@ def cmd_measure(args):
                                 seg_url=args.seg_url, api_key=args.api_key,
                                 compute_comparison=args.compare,
                                 apply_calibration=not args.no_calibration,
+                                scout=not args.no_scout,
                                 progress=lambda m, f: print(f"[{f*100:3.0f}%] {m}"))
         if levels:
             # restrict to requested levels (already segmented & cached)
@@ -114,6 +127,7 @@ def _load_case(args, params, compute_comparison, apply_calibration):
                                 api_key=getattr(args, "api_key", None),
                                 compute_comparison=compute_comparison,
                                 apply_calibration=apply_calibration,
+                                scout=not getattr(args, "no_scout", False),
                                 progress=lambda m, f: print(f"[{f*100:3.0f}%] {m}"))
         if levels:
             restricted = {}
@@ -171,6 +185,9 @@ def build_parser():
                    help="also measure every ROI method per level (reproducibility study)")
     m.add_argument("--no-calibration", action="store_true",
                    help="skip kVp/scanner HU calibration (report raw HU)")
+    m.add_argument("--no-scout", action="store_true",
+                   help="skip the scout-film body-habitus measurement "
+                        "(width/depth per level)")
     m.add_argument("--out", required=True, help="output folder")
     m.add_argument("--fast", action="store_true",
                    help="force fast (3mm) segmentation (default: full-res when using a "
@@ -195,6 +212,7 @@ def build_parser():
     val.add_argument("--roi-mode", default=DEFAULT_MODE,
                      choices=list(EXPOSED_MODES.values()))
     val.add_argument("--no-calibration", action="store_true")
+    val.add_argument("--no-scout", action="store_true")
     val.add_argument("--out", required=True, help="output folder")
     val.add_argument("--fast", action="store_true")
     val.add_argument("--seg-url", dest="seg_url", default=None)

@@ -124,6 +124,46 @@ def test_excluded_level_cannot_be_accepted_or_rejected():
     assert win.state.results["L1"].accepted is None        # Enter did not accept
 
 
+def test_scout_checkbox_follows_scout_availability(test_data_dir):
+    # The checkbox is only offered for studies that actually ship localizers;
+    # the de-identified re-exports dropped theirs, and the UI has to say so
+    # rather than silently producing no habitus numbers.
+    from spine_hu_tool.app.viewer import MainWindow
+    win = MainWindow()
+
+    win._load_folder(os.path.join(test_data_dir, "10000680"))
+    assert win.scout_cb.isEnabled() and win.scout_cb.isChecked()
+    assert "no scout" not in win.scout_cb.text()
+
+    anon = os.path.join(test_data_dir, "Anon2")
+    if not os.path.isdir(anon):
+        pytest.skip("Anon2 study not available")
+    win._load_folder(anon)
+    assert not win.scout_cb.isEnabled()
+    assert not win.scout_cb.isChecked()
+    assert "no scout films" in win.scout_cb.text()
+
+    # ...and re-enables when a study with scouts is opened again
+    win._load_folder(os.path.join(test_data_dir, "10000680"))
+    assert win.scout_cb.isEnabled() and win.scout_cb.isChecked()
+
+
+def test_stats_panel_shows_habitus_only_when_measured():
+    from spine_hu_tool.app.viewer import MainWindow
+    win = MainWindow()
+    win.load_state(_state())
+    win.level_list.setCurrentRow(0)
+
+    assert MainWindow._habitus_line({"median_HU": 150.0}) == ""
+
+    r = win.state.results["L1"]
+    r.stats.update({"body_width_lr_mm": 379.9, "body_depth_ap_mm": 307.5,
+                    "body_effective_diameter_mm": 341.8})
+    win._update_stats_panel(r)
+    text = win.hu_label.text()
+    assert "body habitus" in text and "380 mm (LR)" in text and "308 mm (AP)" in text
+
+
 def test_chooser_collapses_to_one_row_per_study(test_data_dir):
     # opening a parent folder shows ONE selectable row per study (kernel
     # duplicates like STANDARD+BONE collapsed), and preselects a real series.

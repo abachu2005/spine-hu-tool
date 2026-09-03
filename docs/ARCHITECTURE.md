@@ -65,6 +65,10 @@ flowchart TD
     qc --> cal["kVp / scanner calibration (context)"]
     cal --> review["Review UI (accept / reject / adjust)"]
     review --> export["Export CSV / JSON / overlays / masks / audit"]
+    select -.-> scout["Scout films (localizers)"]
+    scout --> habitus["Body outline -> per-level width / depth"]
+    axes -.->|level z extents| habitus
+    habitus --> review
 ```
 
 The heavy ML (segmentation) happens once and is cached; **everything downstream
@@ -150,7 +154,18 @@ TotalSegmentator + weights into a user-writable environment outside the app
 bundle. This keeps the installer at ~130 MB while letting anyone opt into local
 processing. See `spine_hu_tool/segmentation/local_setup.py`.
 
-### 5.9 Everything is recorded (reproducibility + audit)
+### 5.9 Body habitus comes from the scout, not the axial volume
+A spine protocol reconstructs a tight, spine-centered FOV (280 mm / 246 mm on the
+project studies), so the flanks and belly run off the edge of every axial slice —
+the body outline is simply not in the volume. The scouts span the full ~530 mm
+scan field, share the axial series' z frame, and are therefore the only place
+per-level width and depth can be measured. The measurement is deterministic
+(relative thresholds, largest-run outline, divergent-beam correction solved
+between the two views) and **failure-isolated**: an absent or unreadable
+localizer degrades to "not available" and never costs the physician their HU
+results. See `spine_hu_tool/scout/`.
+
+### 5.10 Everything is recorded (reproducibility + audit)
 Each export includes a `reproducibility.json` (tool version, full config, params,
 calibration, segmentation status, volume metadata, and every measurement) plus
 an append-only physician **audit trail**. The measurement should be
@@ -170,6 +185,11 @@ regenerable and the review defensible. See `spine_hu_tool/export/`.
   within consistent protocols; prefer STANDARD-kernel non-contrast values.
 - Levels with hardware (or within the streak buffer) are excluded and must not be
   reported; partial/edge vertebrae are flagged for review.
+- Scout body habitus reproduces to **~1 %** across the two independent studies of
+  the project's one patient with localizers (effective diameter: +2.1 mm bias,
+  2.2 mm mean absolute difference at overlapping levels). It has not yet been
+  checked against a second patient, because the later de-identified re-exports
+  did not retain their localizer series.
 
 ## 7. Out of scope
 
@@ -188,6 +208,7 @@ batch infrastructure; formal regulatory submission (intended use documented only
 | The only ML + safety gate | `segmentation/` | [README](../spine_hu_tool/segmentation/README.md) |
 | Local frames, morphology | `geometry/` | [README](../spine_hu_tool/geometry/README.md) |
 | Body isolation, ROI modes | `roi/` | [README](../spine_hu_tool/roi/README.md) |
+| Scout body habitus | `scout/` | [README](../spine_hu_tool/scout/README.md) |
 | HU stats, QC, tagging, calibration | `measurement/` | [README](../spine_hu_tool/measurement/README.md) |
 | Overlay rendering | `visualization/` | [README](../spine_hu_tool/visualization/README.md) |
 | CSV/JSON/masks/audit | `export/` | [README](../spine_hu_tool/export/README.md) |

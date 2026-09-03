@@ -28,6 +28,7 @@ def write_results_csv(results: dict, path: str) -> str:
 
 
 def write_results_json(case: dict, path: str) -> str:
+    from ..scout.thickness import scout_json
     payload = {
         "results": {lvl: r.summary() for lvl, r in case["results"].items()},
         "level_tags": case.get("level_tags", []),
@@ -36,6 +37,7 @@ def write_results_json(case: dict, path: str) -> str:
         "seg_status": case.get("seg_status"),
         "seg_global_reasons": (case.get("seg_check") or {}).get("global_reasons", []),
         "calibration": case.get("calibration"),
+        "scout": scout_json(case.get("scout")),
     }
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
@@ -72,6 +74,7 @@ def write_comparison(results: dict, json_path: str, csv_path: str):
 
 def write_reproducibility(case: dict, volume_meta: dict, path: str) -> str:
     """Everything needed to regenerate the measurement bit-for-bit."""
+    from ..scout.thickness import scout_json
     try:
         import torch
         torch_v = torch.__version__
@@ -90,6 +93,7 @@ def write_reproducibility(case: dict, volume_meta: dict, path: str) -> str:
         "calibration": case.get("calibration"),
         "volume": volume_meta,
         "level_tags": case.get("level_tags", []),
+        "scout": scout_json(case.get("scout")),
         "measurements": {lvl: r.summary() for lvl, r in case["results"].items()},
     }
     with open(path, "w") as f:
@@ -120,6 +124,33 @@ class AuditTrail:
             json.dump(self.entries, f, indent=2)
 
 
+def write_scout_overlays(case: dict, out_dir: str) -> list[str]:
+    """Render one annotated PNG per scout view (the habitus audit trail).
+
+    The body outline is verified from these images rather than in the review UI,
+    so a reviewer can confirm the traced boundary followed the skin surface and
+    excluded the CT couch.
+    """
+    block = case.get("scout") or {}
+    scouts = block.get("_scouts") or []
+    profiles = block.get("_profiles") or {}
+    if not scouts:
+        return []
+    from ..visualization.overlays import render_scout_overlay
+    paths = []
+    for s in scouts:
+        prof = profiles.get(s.view)
+        if prof is None:
+            continue
+        path = os.path.join(out_dir, f"scout_{s.view}.png")
+        try:
+            render_scout_overlay(s, prof, block.get("levels"), path)
+        except Exception:
+            continue        # an overlay must never break an export
+        paths.append(path)
+    return paths
+
+
 def export_case(case: dict, volume, out_dir: str,
                 overlays: bool = True, masks: bool = True) -> dict:
     """Write CSV + JSON + reproducibility (+ overlays/masks) for a case."""
@@ -148,6 +179,9 @@ def export_case(case: dict, volume, out_dir: str,
             render_roi_overlay(hu_crop, r, volume.spacing,
                                os.path.join(odir, f"{lvl}.png"), level=lvl)
         written["overlays"] = odir
+        scout_paths = write_scout_overlays(case, odir)
+        if scout_paths:
+            written["scout_overlays"] = ", ".join(scout_paths)
 
     if masks:
         from ..io.nifti_io import save_mask_nifti

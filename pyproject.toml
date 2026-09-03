@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spine-hu-tool"
-version = "0.1.0"
+# Single source of truth: spine_hu_tool.__version__, which is also what every
+# export stamps into reproducibility.json as tool_version.
+dynamic = ["version"]
 description = "Deterministic, physician-reviewable trabecular vertebral-HU measurement from CT"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,6 +32,9 @@ spine-hu-server = "spine_hu_tool.server.app:main"
 
 [project.gui-scripts]
 spine-hu-gui = "spine_hu_tool.app.viewer:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "spine_hu_tool.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["spine_hu_tool*"]

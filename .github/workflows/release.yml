@@ -39,6 +39,19 @@ jobs:
         with:
           python-version: "3.12"
 
+      # A build that advertises one version while stamping another into its
+      # reproducibility.json is worse than a build that fails, so check first.
+      - name: Check version consistency
+        shell: bash
+        run: |
+          # On a tag build the tag is the release identity, so require the code
+          # to agree with it as well as with the packaging files.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            python packaging/sync_version.py --check --expect "${GITHUB_REF_NAME#v}"
+          else
+            python packaging/sync_version.py --check
+          fi
+
       - name: Install client + build deps
         shell: bash
         run: |

@@ -12,10 +12,56 @@ from typing import Callable, Optional
 from ..io.series_selector import select_ct_series, SeriesInfo
 from ..io.dicom_loader import load_series
 from ..segmentation.backends import segment, resolve_seg_url
-from ..config import ROIParams
+from ..config import ROIParams, ScoutParams
 from .review_state import ReviewState
 
 ProgressCb = Optional[Callable[[str, float], None]]
+
+
+def has_scouts(folder: str, series: Optional[SeriesInfo] = None,
+               candidates: Optional[list] = None) -> bool:
+    """Whether the study in `folder` ships localizer series we can measure.
+
+    Header-only -- it never decodes pixel data -- so the UI can call it whenever
+    the folder or the selected study changes, to decide whether the scout
+    checkbox should be offered at all.
+    """
+    try:
+        from ..io.series_selector import scan_series
+        if candidates is None:
+            candidates = scan_series(folder)
+        study_uid = series.study_uid if series is not None else None
+        return any("LOCALIZER" in set(c.image_type)
+                   and (not study_uid or c.study_uid == study_uid)
+                   for c in candidates)
+    except Exception:
+        return False
+
+
+def measure_scout(state: ReviewState, folder: str,
+                  params: Optional[ScoutParams] = None,
+                  candidates: Optional[list] = None) -> dict:
+    """Measure body habitus from the study's scouts and merge it into `state`.
+
+    Attaches the full block to ``case["scout"]`` and copies each level's width /
+    depth into that level's ``ROIResult.stats`` so the numbers flow through the
+    existing summary/CSV/JSON writers untouched. Scout QC messages are appended
+    to the level's warnings, where the GUI and exports already surface them.
+    """
+    from ..scout.thickness import habitus_for_case
+    block = habitus_for_case(folder, state.volume, state.seg,
+                             results=list(state.results),
+                             params=params, candidates=candidates)
+    state.case["scout"] = block
+    for lvl, vals in block.get("levels", {}).items():
+        r = state.results.get(lvl)
+        if r is None:
+            continue
+        warns = vals.get("scout_warnings") or []
+        r.stats.update({k: v for k, v in vals.items() if k != "scout_warnings"})
+        if warns:
+            r.qc.setdefault("warnings", []).extend(warns)
+    return block
 
 
 def _seg_cache_dir() -> str:
@@ -84,6 +130,8 @@ def analyze_dataset(folder: str, series: Optional[SeriesInfo] = None,
                     local: bool = False,
                     compute_comparison: bool = False,
                     apply_calibration: bool = True,
+                    scout: bool = True,
+                    scout_params: Optional[ScoutParams] = None,
                     progress: ProgressCb = None) -> ReviewState:
     def report(msg, frac):
         if progress:
@@ -103,14 +151,16 @@ def analyze_dataset(folder: str, series: Optional[SeriesInfo] = None,
     #                   on a first/uncached run
     #   measurement   : 0.10 - 1.00 (determinate, reported per vertebral level)
     report("Selecting CT series...", 0.03)
+    candidates = None
     if series is None:
-        series, _cands = select_ct_series(folder)
+        series, candidates = select_ct_series(folder)
     if series is None:
         raise RuntimeError("No usable axial CT series found in folder.")
 
     report(f"Loading series ({series.n_files} slices)...", 0.08)
     volume = load_series(series.files, metadata={
         "series_uid": series.series_uid,
+        "study_uid": series.study_uid,
         "series_desc": series.description,
         "kernel": series.kernel,
         "slice_thickness": series.slice_thickness,
@@ -140,5 +190,16 @@ def analyze_dataset(folder: str, series: Optional[SeriesInfo] = None,
         compute_comparison=compute_comparison, apply_calibration=apply_calibration,
         reviewer=reviewer, audit_path=audit_path,
         progress=lambda m, f: report(m, 0.10 + 0.90 * f))
+
+    if scout:
+        # Body habitus is an adjunct measurement: a missing, odd or unreadable
+        # localizer must never cost the physician their HU results.
+        report("Measuring body habitus from scout films...", 0.98)
+        try:
+            measure_scout(state, folder, params=scout_params,
+                          candidates=candidates)
+        except Exception as exc:
+            state.case["scout"] = {"available": False, "views": {}, "levels": {},
+                                   "warnings": [f"scout measurement failed: {exc}"]}
     report("Done.", 1.0)
     return state

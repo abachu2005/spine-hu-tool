@@ -45,6 +45,72 @@ def make_vertebra_phantom(spacing=(1.0, 1.0, 1.0),
     return full.astype(bool), body.astype(bool), hu
 
 
+def make_scout_pair(width_lr_mm=360.0, depth_ap_mm=280.0,
+                    center=(0.0, 20.0), z_range=(-200.0, 200.0),
+                    col_spacing=0.6, row_spacing=0.55,
+                    sid_mm=950.0, sod_mm=540.0, background=-450.0,
+                    body_peak=900.0, table=True, magnify=True):
+    """An AP + lateral scout pair through an elliptical torso of known size.
+
+    The torso is a z-invariant ellipse centered at ``center`` = (x, y) in patient
+    millimeters, projected the way a real scanner does: each ray's value is
+    proportional to its chord length through the ellipse, and (when `magnify`)
+    the projection is scaled by the divergent-beam factor SOD / (SOD + d) for
+    the body-center offset d along that view's beam axis. `table` adds the flat
+    low-attenuation couch slab that only the lateral view sees.
+
+    Returns (ap_scout, lat_scout) as :class:`ScoutImage` objects, so the whole
+    measurement stack can be exercised with no DICOM and a known right answer.
+    """
+    from ..scout.loader import ScoutImage
+
+    cx, cy = center
+    half = {0: width_lr_mm / 2.0, 1: depth_ap_mm / 2.0}
+    ctr = {0: cx, 1: cy}
+    n_cols, n_rows = 888, int(round((z_range[1] - z_range[0]) / row_spacing))
+    span = n_cols * col_spacing
+
+    out = []
+    for axis in (0, 1):
+        beam_axis = 1 - axis
+        # An object offset toward the source (negative d with this sign
+        # convention) casts a larger shadow: apparent = true * SOD / (SOD + d).
+        mag = 1.0
+        if magnify and sod_mm:
+            mag = sod_mm / (sod_mm + ctr[beam_axis])
+        # Columns run along +axis for the AP view and -y for the lateral view,
+        # matching the ImageOrientationPatient of a real CT localizer.
+        sign = 1.0 if axis == 0 else -1.0
+        origin = [0.0, 0.0, z_range[1]]
+        origin[axis] = -sign * span / 2.0
+        coord = origin[axis] + sign * np.arange(n_cols) * col_spacing
+
+        # Apparent (projected) ellipse half-width and center at the image plane.
+        a = half[axis] * mag
+        c = ctr[axis] * mag
+        u = (coord - c) / a
+        chord = np.sqrt(np.clip(1.0 - u ** 2, 0.0, None))
+        row = background + body_peak * chord
+        pixels = np.tile(row.astype(np.float32), (n_rows, 1))
+
+        if table and axis == 1:
+            # Couch: a flat slab posterior to the patient, at ~8% of body peak,
+            # exactly the signature seen on the real scanners.
+            slab = (coord > ctr[1] + half[1] + 8.0) & (coord < ctr[1] + half[1] + 55.0)
+            pixels[:, slab] = background + 0.08 * body_peak
+
+        row_dir = [0.0, 0.0, 0.0]
+        row_dir[axis] = sign
+        out.append(ScoutImage(
+            pixels=pixels, view="AP" if axis == 0 else "LAT",
+            axis=axis, beam_axis=beam_axis,
+            row_spacing_mm=row_spacing, col_spacing_mm=col_spacing,
+            origin=tuple(origin), row_dir=tuple(row_dir),
+            col_dir=(0.0, 0.0, -1.0), sid_mm=sid_mm, sod_mm=sod_mm,
+            description="synthetic"))
+    return out[0], out[1]
+
+
 def make_tilted_ellipsoid(spacing=(1.0, 1.0, 1.0), shape=(50, 50, 50),
                           radii=(8.0, 8.0, 18.0), tilt_deg=20.0):
     """Tall ellipsoid rotated by `tilt_deg` about the x-axis (y-z plane)."""

@@ -25,13 +25,15 @@ is the **map of the package** and the **order the pieces run in**.
    placement modes (centroid / cylinder / westerhoff).
 6. **`measurement/`** — HU statistics, per-ROI QC, per-level metal/streak
    tagging, and kVp/scanner calibration + soft literature context.
-7. **`visualization/`** — greyscale tri-planar overlay rendering.
-8. **`export/`** — CSV/JSON, overlays, masks, reproducibility record, audit trail.
-9. **`app/`** — the PySide6 review viewer, the CLI, review-state backend, and
-   the validation/reproducibility harness.
-10. **`server/`** — the FastAPI segmentation service (offloadable to Cloud Run).
-11. **`validation/`** — internal-consistency checks (scan-rescan, ROI-mode).
-12. **`tests/`** — synthetic-phantom unit tests + cached integration tests.
+7. **`scout/`** — optional adjunct: per-level body width/depth from the localizer
+   films (the axial FOV is too tight to contain the body outline).
+8. **`visualization/`** — greyscale tri-planar overlay rendering.
+9. **`export/`** — CSV/JSON, overlays, masks, reproducibility record, audit trail.
+10. **`app/`** — the PySide6 review viewer, the CLI, review-state backend, and
+    the validation/reproducibility harness.
+11. **`server/`** — the FastAPI segmentation service (offloadable to Cloud Run).
+12. **`validation/`** — internal-consistency checks (scan-rescan, ROI-mode).
+13. **`tests/`** — synthetic-phantom unit tests + cached integration tests.
 
 ## The one rule to remember
 

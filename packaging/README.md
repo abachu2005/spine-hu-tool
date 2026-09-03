@@ -13,7 +13,29 @@ enough to download over the web.
 | `linux/build_appimage.sh` | Build the Linux AppImage. |
 | `download/index.html`, `version.json` | The public download page + version metadata. |
 | `upload_to_gcs.sh` | Publish page + installers to the public GCS bucket. |
+| `sync_version.py` | Propagate one version number to every file that ships one. |
 | `SIGNING.md` | Code-signing notes. |
+
+## One version number
+
+`spine_hu_tool.__version__` is the source of truth, because it is what every
+export stamps into `reproducibility.json` as `tool_version` — the field that
+ties a measurement back to the code that produced it. A build that advertises
+one version while stamping another makes that field worthless.
+
+`pyproject.toml` and `spine_hu.spec` read the attribute directly. Inno Setup
+cannot (it has no way to run Python) and the download page's `version.json` is
+served as a static file, so those two carry a copy that `sync_version.py`
+rewrites:
+
+```bash
+python packaging/sync_version.py --set 0.1.4   # cut a release
+python packaging/sync_version.py --check       # what CI runs
+```
+
+CI runs `--check` before building anything, and on a tag push it additionally
+requires `__version__` to equal the tag, so `v0.1.4` cannot ship binaries whose
+exports identify themselves as `0.1.3`.
 
 ## Why lean, cloud-segmenting installers
 
@@ -44,7 +66,8 @@ cache (immutable per release). CI does the same automatically on a tag push.
 
 ```mermaid
 flowchart LR
-    tag["git tag / push"] --> ci["CI (GitHub Actions)"]
+    tag["git tag / push"] --> check["Version consistency check"]
+    check --> ci["CI (GitHub Actions)"]
     ci --> mac["macOS .dmg"]
     ci --> win["Windows setup.exe"]
     ci --> lin["Linux AppImage"]

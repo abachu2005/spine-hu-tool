@@ -142,17 +142,18 @@ class AnalyzeWorker(QtCore.QThread):
     failed = QtCore.Signal(str)
 
     def __init__(self, folder, series, mode, reviewer, seg_url=None, api_key=None,
-                 local=False):
+                 local=False, scout=True):
         super().__init__()
         self.folder, self.series, self.mode, self.reviewer = folder, series, mode, reviewer
         self.seg_url, self.api_key, self.local = seg_url, api_key, local
+        self.scout = scout
 
     def run(self):
         try:
             st = analyze_dataset(self.folder, series=self.series, mode=self.mode,
                                  only_clean=True, reviewer=self.reviewer,
                                  seg_url=self.seg_url, api_key=self.api_key,
-                                 local=self.local,
+                                 local=self.local, scout=self.scout,
                                  progress=lambda m, f: self.progress.emit(m, f))
             self.finished_state.emit(st)
         except Exception as e:  # surfaced to the user
@@ -192,6 +193,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show_roi = True
         self._drag_active = False     # coalesce a cursor drag into one undo step
         self._radius_active = False   # coalesce a slider sweep into one undo step
+        self._populating = False      # suppress combo signals while repopulating
+        self._candidates = None
         self._build()
         # First launch: show the pilot / non-PHI disclaimer once the window is up.
         QtCore.QTimer.singleShot(0, self._maybe_show_first_run_disclaimer)
@@ -268,12 +271,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setup_local_btn.setFixedWidth(420)
         self.setup_local_btn.clicked.connect(self.setup_local_seg)
         self._refresh_local_seg_state()
+        # Body habitus from the scout films. Off unless the opened study actually
+        # ships localizers, which many de-identified exports drop.
+        self.scout_cb = QtWidgets.QCheckBox("Record scout film measurements")
+        self.scout_cb.setToolTip(
+            "Measure the patient's body width and depth at each vertebral level "
+            "from the scout (localizer) films. The axial images are cropped to "
+            "the spine, so the body outline only exists on the scouts.")
+        self.scout_cb.setChecked(True)
+        self._set_scout_available(True)
         self.roi_mode_combo = QtWidgets.QComboBox(); self.roi_mode_combo.setFixedWidth(420)
         for label, key in EXPOSED_MODES.items():
             self.roi_mode_combo.addItem(label, key)
         self.roi_mode_combo.setCurrentText(MODE_LABELS.get(DEFAULT_MODE, "centroid"))
         self.series_combo = QtWidgets.QComboBox(); self.series_combo.setFixedWidth(420)
         self.series_combo.setVisible(False)
+        # Scout availability is per study, so re-check whenever the pick changes.
+        self.series_combo.currentIndexChanged.connect(
+            lambda _i: None if self._populating else self._refresh_scout_state())
         self.analyze_btn = QtWidgets.QPushButton("Analyze")
         self.analyze_btn.setFixedWidth(260); self.analyze_btn.setVisible(False)
         self.analyze_btn.clicked.connect(self.start_analyze)
@@ -281,7 +296,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setVisible(False)
         self.status_lbl = QtWidgets.QLabel(""); self.status_lbl.setAlignment(QtCore.Qt.AlignCenter)
         for widget in (title, sub, btn, self.seg_url_edit, self.local_seg_cb,
-                       self.setup_local_btn, self.roi_mode_combo, self.series_combo,
+                       self.setup_local_btn, self.scout_cb, self.roi_mode_combo,
+                       self.series_combo,
                        self.analyze_btn, self.progress, self.status_lbl):
             v.addWidget(widget, alignment=QtCore.Qt.AlignHCenter)
         v.addStretch()
@@ -379,6 +395,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.folder = folder
         from ..io.series_selector import select_ct_series, list_studies
         best, cands = select_ct_series(folder)
+        self._candidates = cands
+        self._populating = True
         self.series_combo.clear()
         self._row_series = {}        # selectable combo row -> SeriesInfo
         patients = list_studies(cands, axial_only=True)
@@ -397,7 +415,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     best_row = row
         if best_row is not None:
             self.series_combo.setCurrentIndex(best_row)
+        self._populating = False
         self.series_combo.setVisible(True); self.analyze_btn.setVisible(True)
+        self._refresh_scout_state()
         n_studies = len(self._row_series)
         if best is not None:
             self.status_lbl.setText(
@@ -408,6 +428,27 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.status_lbl.setText("No DICOM CT series found in this folder.")
         return best
+
+    def _set_scout_available(self, available: bool):
+        """Enable/disable the scout checkbox and say why when it is off."""
+        self.scout_cb.setEnabled(available)
+        if available:
+            self.scout_cb.setText("Record scout film measurements")
+        else:
+            self.scout_cb.setChecked(False)
+            self.scout_cb.setText(
+                "Record scout film measurements  (no scout films in this study)")
+
+    def _refresh_scout_state(self):
+        """Check the currently selected study for localizers."""
+        from .analysis import has_scouts
+        series = getattr(self, "_row_series", {}).get(self.series_combo.currentIndex())
+        available = bool(self.folder) and has_scouts(
+            self.folder, series=series, candidates=getattr(self, "_candidates", None))
+        was_enabled = self.scout_cb.isEnabled()
+        self._set_scout_available(available)
+        if available and not was_enabled:
+            self.scout_cb.setChecked(True)
 
     def _on_local_toggled(self, checked):
         # The server URL is irrelevant when segmenting locally; grey it out so the
@@ -469,7 +510,8 @@ class MainWindow(QtWidgets.QMainWindow):
         seg_url = self.seg_url_edit.text().strip() or None
         mode = self.roi_mode_combo.currentData() or DEFAULT_MODE
         self.worker = AnalyzeWorker(self.folder, self.series, mode,
-                                    "physician", seg_url=seg_url, local=local)
+                                    "physician", seg_url=seg_url, local=local,
+                                    scout=self.scout_cb.isChecked())
         self.worker.progress.connect(self._on_progress)
         self.worker.finished_state.connect(self._on_analyzed)
         self.worker.failed.connect(self._on_failed)
@@ -743,15 +785,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_rendered_level = self.current_level
         self._update_stats_panel(r)
 
+    @staticmethod
+    def _habitus_line(stats) -> str:
+        """One-line body habitus summary, or '' when no scout values exist."""
+        w, d = stats.get("body_width_lr_mm"), stats.get("body_depth_ap_mm")
+        if w is None and d is None:
+            return ""
+        parts = []
+        if w is not None:
+            parts.append(f"width {w:.0f} mm (LR)")
+        if d is not None:
+            parts.append(f"depth {d:.0f} mm (AP)")
+        eff = stats.get("body_effective_diameter_mm")
+        if eff is not None:
+            parts.append(f"eff. diam {eff:.0f} mm")
+        return ("<span style='color:#8a8a92'>body habitus (scout): "
+                + " | ".join(parts) + "</span><br>")
+
     def _update_stats_panel(self, r):
         s = r.stats
         warns = "<br>".join(f"&bull; {w}" for w in r.qc.get("warnings", [])) or "none"
+        habitus = self._habitus_line(s)
         self.radius_val.setText(f"{r.radius_mm:.1f}")
         if r.qc.get("qc_status") == "excluded":
             self.hu_label.setText(
                 f"<b>{r.level}</b> ({MODE_LABELS.get(r.mode, r.mode)})<br>"
                 f"<b style='color:#c5544a'>EXCLUDED</b> - no HU reported<br>"
-                f"reason: {r.qc.get('exclusion_reason', '')}<br>{warns}")
+                f"reason: {r.qc.get('exclusion_reason', '')}<br>{habitus}{warns}")
             return
         cal = s.get("calibrated_median_HU")
         cal_line = (f"calibrated median {cal:.0f} HU<br>"
@@ -765,6 +825,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"SD {s.get('sd_HU', float('nan')):.0f} | p05-p95 {s.get('p05_HU', float('nan')):.0f}-{s.get('p95_HU', float('nan')):.0f}<br>"
             f"radius {r.radius_mm:.1f} mm | clearance {r.margin_mm:.1f} mm<br>"
             f"volume {s.get('volume_mm3', 0):.0f} mm&sup3;<br>"
+            f"{habitus}"
             f"<b>QC: {r.qc.get('qc_status')}</b><br>{ctx_line}{warns}")
 
     def export(self):

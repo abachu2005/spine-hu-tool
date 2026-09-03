@@ -27,9 +27,28 @@ Units (HU)** in vertebral bodies from CT — an opportunistic bone-density signa
    stay clear of cortex (size-proportional margin + adaptive radius).
 6. Compute **HU statistics** and **QC flags** (metal proximity, heterogeneity,
    clipping, partial vertebra, cortical-tail hint) → pass / review / fail.
-7. **Review** in a greyscale, PACS-style desktop app (accept / reject / adjust).
-8. **Export** CSV/JSON, tri-planar overlays, masks (NIfTI), a full
+7. Optionally measure **body habitus** — left-right width and anterior-posterior
+   depth per level — from the **scout films**, corrected for beam divergence.
+8. **Review** in a greyscale, PACS-style desktop app (accept / reject / adjust).
+9. **Export** CSV/JSON, tri-planar overlays, masks (NIfTI), a full
    reproducibility record, and an audit trail.
+
+## Body habitus from the scout films
+
+Tick **"Record scout film measurements"** on the landing page (or drop
+`--no-scout` on the CLI) to also get, per vertebral level, the patient's
+left-right width, anterior-posterior depth, and effective diameter in
+millimeters — useful as an outcomes-research covariate.
+
+This has to come from the scouts: a spine protocol reconstructs a tight,
+spine-centered field of view, so the body runs off the edge of every axial slice
+and its outline exists only in the ~530 mm-wide localizers. The measurement is
+deterministic (relative thresholds, largest-run outline, divergent-beam
+correction solved between the AP and lateral views) and reproduces to ~1 % across
+the two independent studies of the project's one patient with scouts. Studies
+whose de-identified export dropped the localizers are detected up front: the
+checkbox disables itself and the HU pipeline runs unchanged. See
+[`spine_hu_tool/scout/`](spine_hu_tool/scout/README.md).
 
 ## Why a centroid sphere
 
@@ -126,6 +145,7 @@ spine_hu_tool/
   segmentation/  TotalSegmentator runner (the only ML) + level helpers
   geometry/      coordinate transforms, morphology, per-vertebra local axes
   roi/           body isolation, distance transform, ROI placement modes
+  scout/         body habitus (width/depth per level) from the localizer films
   measurement/   HU stats, ROI QC, per-level metal/streak tagging
   visualization/ greyscale tri-planar overlay rendering
   export/        CSV/JSON/overlay/mask + reproducibility + audit trail
@@ -156,6 +176,9 @@ tests use the cached test data when present and skip otherwise.
   within consistent protocols; report STANDARD-kernel non-contrast values.
 - Levels with hardware (or within the streak buffer) are excluded and must not
   be reported; partial/edge vertebrae are flagged for review.
+- Scout body habitus reproduces to ~1 % across the two independent studies of the
+  one patient whose export retained localizers; it has not yet been checked
+  across patients, because the later de-identified re-exports dropped theirs.
 
 ## Out of scope
 

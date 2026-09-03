@@ -9,7 +9,9 @@
 ; The PyInstaller onedir output lives in "packaging\dist\Spine HU Tool\".
 
 #define AppName "Spine HU Tool"
-#define AppVersion "0.1.0"
+; Kept in sync with spine_hu_tool.__version__ by packaging/sync_version.py
+; (Inno Setup cannot read it directly). CI fails the build if this drifts.
+#define AppVersion "0.1.3"
 #define AppPublisher "Spine HU Tool"
 #define AppExeName "Spine HU Tool.exe"
 

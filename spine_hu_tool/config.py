@@ -52,6 +52,42 @@ RETAINED_FRACTION_FLAG = 0.95    # sphere clipped if less than this fraction kep
 CORTICAL_TAIL_P95_HU = 400.0     # p95 inside ROI above this hints cortex contamination
 MIN_ROI_VOLUME_MM3 = 100.0       # ROI smaller than this -> too small
 
+# --- Scout (localizer) body-habitus measurement --------------------------------
+# A scout is a projection radiograph, so "air" is NOT -1000 HU: the values are
+# line integrals and the background sits near -450 on the scanners seen so far.
+# Every threshold is therefore expressed RELATIVE to a per-image background
+# estimate and a per-image body-attenuation reference, never as an absolute HU.
+SCOUT_BG_BORDER_COLS = 15        # columns at each edge used to estimate air
+# The body-attenuation reference is measured PER ROW (then smoothed along z), not
+# once for the whole image: a scan whose field includes the shoulders and arms has
+# a far higher global peak than one that does not, and a global reference would
+# make the same patient measure ~10 mm narrower on the study that includes them.
+SCOUT_REF_PERCENTILE = 98.0      # per-row percentile of (value - background)
+SCOUT_REF_SMOOTH_MM = 15.0       # z-smoothing of the per-row reference
+# Body edge = largest contiguous run above this fraction of the body reference.
+# The CT couch projects as a low, flat plateau (~8% of body attenuation in the
+# lateral view), so this threshold also excludes the table without a dedicated
+# table model; taking the LARGEST run additionally rejects table-rail spikes.
+SCOUT_BODY_THRESHOLD_FRAC = 0.15
+SCOUT_SMOOTH_MM = 5.0            # median-smoothing of the per-row width profile
+SCOUT_LEVEL_BAND_FRAC = 0.60     # central fraction of a level's SI extent to average
+# Divergent-beam magnification: apparent = true * SOD / (SOD + d), where d is the
+# body-center offset along the beam axis. The AP and lateral views measure each
+# other's offset, so the correction is solved by iterating between them.
+SCOUT_MAG_ITERS = 2
+SCOUT_BEAM_SIGN = 1.0            # +1: image-plane normal points away from the source
+SCOUT_MAX_CENTER_OFFSET_MM = 60.0   # larger -> flag (correction becomes unreliable)
+SCOUT_EDGE_MARGIN_MM = 5.0       # extent this close to the image edge -> clipped
+SCOUT_MIN_PLAUSIBLE_MM = 80.0    # outside this band the row is not a torso cross
+SCOUT_MAX_PLAUSIBLE_MM = 500.0   # (e.g. arms/shoulders in the projected field)
+# Rows within one level should agree closely; a large spread means the outline
+# jumped (typically between an arm and the torso) rather than following skin.
+SCOUT_MAX_ROW_SPREAD_MM = 40.0
+# At and above T2 the shoulder girdle and upper arms project over the torso, so
+# the AP "width" there is a shoulder width. Anatomy, not a fitted threshold.
+SCOUT_SHOULDER_GIRDLE_LEVELS = ("C1", "C2", "C3", "C4", "C5", "C6", "C7",
+                                "T1", "T2")
+
 # --- Literature anchoring (reporting only; not used for decisions) -------------
 L1_OSTEOPOROSIS_HU = 110.0       # approx; Pickhardt et al.
 L1_NORMAL_HU = 160.0
@@ -82,6 +118,27 @@ class ROIParams:
     roi_volume_frac: float = ROI_VOLUME_FRAC
     anterior_frac: float = ANTERIOR_FRAC
     cylinder_height_frac: float = CYLINDER_HEIGHT_FRAC
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class ScoutParams:
+    """Parameters that fully determine a scout body-habitus measurement."""
+    bg_border_cols: int = SCOUT_BG_BORDER_COLS
+    ref_percentile: float = SCOUT_REF_PERCENTILE
+    ref_smooth_mm: float = SCOUT_REF_SMOOTH_MM
+    body_threshold_frac: float = SCOUT_BODY_THRESHOLD_FRAC
+    smooth_mm: float = SCOUT_SMOOTH_MM
+    level_band_frac: float = SCOUT_LEVEL_BAND_FRAC
+    mag_iters: int = SCOUT_MAG_ITERS
+    beam_sign: float = SCOUT_BEAM_SIGN
+    max_center_offset_mm: float = SCOUT_MAX_CENTER_OFFSET_MM
+    edge_margin_mm: float = SCOUT_EDGE_MARGIN_MM
+    min_plausible_mm: float = SCOUT_MIN_PLAUSIBLE_MM
+    max_plausible_mm: float = SCOUT_MAX_PLAUSIBLE_MM
+    max_row_spread_mm: float = SCOUT_MAX_ROW_SPREAD_MM
 
     def to_dict(self) -> dict:
         return asdict(self)

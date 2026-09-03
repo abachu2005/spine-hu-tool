@@ -12,6 +12,7 @@ import numpy as np
 from .. import config
 from ..pipeline import measure_level
 from ..measurement.level_qc import tag_levels, clean_levels
+from ..segmentation.totalseg_runner import VERT_ORDER
 
 
 def _mean_hu(volume, seg, level, mode="centroid_sphere"):
@@ -36,15 +37,47 @@ def scan_rescan(study_a, study_b, levels, mode="centroid_sphere"):
     return rows
 
 
-def mode_agreement(volume, seg, levels, modes=("centroid_sphere",
-                                               "largest_safe_sphere",
-                                               "trabecular_core")):
+def mode_agreement(volume, seg, levels, modes=None):
+    from ..roi.modes import COMPARISON_MODES
+    modes = tuple(modes or COMPARISON_MODES)
     rows = []
     for lvl in levels:
         entry = {"level": lvl}
         for m in modes:
             h, _q = _mean_hu(volume, seg, lvl, m)
             entry[m] = h
+        rows.append(entry)
+    return rows
+
+
+HABITUS_METRICS = (("body_width_lr_mm", "LR width"),
+                   ("body_depth_ap_mm", "AP depth"),
+                   ("body_effective_diameter_mm", "eff. diameter"))
+
+
+def habitus_scan_rescan(block_a: dict, block_b: dict) -> list[dict]:
+    """Per-level body-habitus differences between two studies of one patient.
+
+    The scout measurement's reproducibility claim rests on this: the two studies
+    were acquired on different days with different table heights and coverage, so
+    agreement at the overlapping levels is an end-to-end check of the outline
+    threshold, the couch rejection, and the magnification correction at once.
+    """
+    la = (block_a or {}).get("levels") or {}
+    lb = (block_b or {}).get("levels") or {}
+    shared = set(la) & set(lb)
+    # Superior -> inferior, so the table reads down the spine; anything outside
+    # the standard labelling (e.g. "sacrum") follows, rather than being dropped.
+    order = [l for l in VERT_ORDER if l in shared]
+    order += sorted(shared.difference(order))
+    rows = []
+    for lvl in order:
+        entry = {"level": lvl}
+        for key, _label in HABITUS_METRICS:
+            a, b = la[lvl].get(key), lb[lvl].get(key)
+            if a is None or b is None:
+                continue
+            entry[key] = (a, b, b - a)
         rows.append(entry)
     return rows
 
@@ -60,8 +93,12 @@ def literature_band(mean_hu: float) -> str:
 
 
 def generate_report(studies: dict, out_path: str,
-                    overlap_levels=None) -> str:
-    """studies: {name: (volume, seg)}; writes a markdown validation report."""
+                    overlap_levels=None, scouts: dict | None = None) -> str:
+    """studies: {name: (volume, seg)}; writes a markdown validation report.
+
+    `scouts` optionally maps the same study names to their scout habitus blocks
+    (``case["scout"]``), adding the body-habitus scan-rescan section.
+    """
     names = list(studies)
     lines = ["# Spine Vertebral-HU Tool -- Validation Report", ""]
     lines.append("Validation uses internal consistency (no external ground "
@@ -106,19 +143,59 @@ def generate_report(studies: dict, out_path: str,
                          "the centroid sphere brings agreement to within kernel/resolution noise.")
         lines.append("")
 
+    # --- scout body-habitus scan-rescan ---
+    if scouts and len(names) >= 2 and all(scouts.get(n) for n in names[:2]):
+        rows = habitus_scan_rescan(scouts[names[0]], scouts[names[1]])
+        if rows:
+            lines.append("## Scout body-habitus scan-rescan agreement")
+            lines.append(f"Studies: **{names[0]}** vs **{names[1]}**; all levels "
+                         "present in both. Values are millimeters.\n")
+            lines.append("The two studies were acquired on different days with "
+                         "different table heights and different coverage, from "
+                         "independently acquired scout pairs, so this exercises "
+                         "the outline threshold, the couch rejection and the "
+                         "magnification correction end to end.\n")
+            header = " | ".join(f"{lab} A | {lab} B | delta"
+                                for _k, lab in HABITUS_METRICS)
+            lines.append(f"| level | {header} |")
+            lines.append("|---" * (1 + 3 * len(HABITUS_METRICS)) + "|")
+            for r in rows:
+                cells = []
+                for key, _lab in HABITUS_METRICS:
+                    v = r.get(key)
+                    cells.append("- | - | -" if v is None
+                                 else f"{v[0]:.1f} | {v[1]:.1f} | {v[2]:+.1f}")
+                lines.append(f"| {r['level']} | " + " | ".join(cells) + " |")
+            lines.append("")
+            for key, label in HABITUS_METRICS:
+                d = np.array([r[key][2] for r in rows if key in r])
+                if d.size:
+                    lines.append(
+                        f"- **{label}**: bias {d.mean():+.1f} mm, mean absolute "
+                        f"difference {np.abs(d).mean():.1f} mm "
+                        f"(max {np.abs(d).max():.1f}, n={d.size}).")
+            lines.append("- Before the divergent-beam correction the LR width "
+                         "carried an ~8 mm systematic offset between the two "
+                         "studies, whose table heights differ by 12 mm; the "
+                         "correction removes it, which is also the empirical "
+                         "check on the beam-direction sign.")
+            lines.append("")
+
     # --- ROI-mode agreement (first study) ---
+    from ..roi.modes import COMPARISON_MODES
     nm0 = names[0]
     lvls0 = clean_by[nm0][:6]
     lines.append("## ROI-mode agreement")
     lines.append(f"Study **{nm0}**, levels {lvls0}\n")
-    lines.append("| level | centroid | largest_safe | trabecular_core |")
-    lines.append("|---|---|---|---|")
+    lines.append("| level | " + " | ".join(COMPARISON_MODES) + " |")
+    lines.append("|---" * (1 + len(COMPARISON_MODES)) + "|")
+
+    def f(x):
+        return f"{x:.1f}" if x is not None and np.isfinite(x) else "-"
+
     for row in mode_agreement(*studies[nm0], lvls0):
-        def f(x):
-            return f"{x:.1f}" if x is not None else "-"
-        lines.append(f"| {row['level']} | {f(row.get('centroid_sphere'))} | "
-                     f"{f(row.get('largest_safe_sphere'))} | "
-                     f"{f(row.get('trabecular_core'))} |")
+        lines.append(f"| {row['level']} | "
+                     + " | ".join(f(row.get(m)) for m in COMPARISON_MODES) + " |")
     lines.append("")
 
     # --- literature anchoring ---
@@ -147,6 +224,16 @@ def generate_report(studies: dict, out_path: str,
         "be reviewed (e.g. L1 at the inferior edge of a thoracic scan).",
         "- No external ground-truth (e.g. DXA/QCT phantom) calibration is performed.",
     ])
+    if scouts:
+        lines.extend([
+            "- Scout body habitus is measured only where the study retained its "
+            "localizer series; several de-identified re-exports dropped theirs, "
+            "so the habitus check above covers one patient scanned twice, not a "
+            "cross-patient cohort.",
+            "- The scout outline is a projection boundary, not a reconstructed "
+            "skin surface: verify it on the exported scout overlay PNGs before "
+            "reporting, particularly where arms or shoulders enter the field.",
+        ])
     lines.append("")
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)

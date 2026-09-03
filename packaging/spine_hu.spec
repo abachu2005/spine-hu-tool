@@ -21,6 +21,15 @@ ICON_DIR = os.path.join(SPECPATH, "icons")
 
 APP_NAME = "Spine HU Tool"
 
+# Read the version from spine_hu_tool/__init__.py rather than restating it, so
+# the bundle can never advertise a different version than its exports stamp.
+sys.path.insert(0, SPECPATH)
+try:
+    from sync_version import read_version
+    APP_VERSION = read_version(ROOT)
+finally:
+    sys.path.remove(SPECPATH)
+
 if sys.platform == "darwin":
     icon_file = os.path.join(ICON_DIR, "spine_hu.icns")
 elif sys.platform.startswith("win"):
@@ -118,8 +127,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": APP_NAME,
             "CFBundleDisplayName": APP_NAME,
-            "CFBundleShortVersionString": "0.1.0",
-            "CFBundleVersion": "0.1.0",
+            "CFBundleShortVersionString": APP_VERSION,
+            "CFBundleVersion": APP_VERSION,
             "NSHighResolutionCapable": True,
             "NSHumanReadableCopyright": "Pilot / research use only.",
         },
