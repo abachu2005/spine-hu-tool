@@ -37,14 +37,12 @@ CI runs `--check` before building anything, and on a tag push it additionally
 requires `__version__` to equal the tag, so `v0.1.4` cannot ship binaries whose
 exports identify themselves as `0.1.3`.
 
-## Why lean, cloud-segmenting installers
+## Why full offline installers
 
-If the installer bundled PyTorch + TotalSegmentator + weights it would be
-multi-GB and painful to distribute. Instead the packaged app ships **without the
-ML stack** (~130 MB) and **segments on the cloud by default**. Anyone who wants
-local, no-upload processing installs the runtime **on demand** (see
-`spine_hu_tool/segmentation/local_setup.py`), so the download stays small while
-local processing is still one click away.
+The current release bundles Python, PyTorch, TotalSegmentator, and both model
+weight sets so segmentation works locally with no setup or network connection.
+That makes each installer several GB; the cloud backend remains available as an
+option inside the app.
 
 ## Why native installers per OS
 
@@ -60,20 +58,30 @@ The code lives in a **private** GitHub repo, but installers are published to a
 **public-but-unlisted GCS bucket** so labmates can download without a GitHub
 login or credentials. `upload_to_gcs.sh` publishes the download page and version
 metadata with `no-cache` (so updates show immediately) and installers with a long
-cache (immutable per release). CI does the same automatically on a tag push.
+cache (immutable per release). On a tag push, CI tests the code, builds all three
+native installers, uploads them to the versioned path, verifies every object,
+then updates `latest/` and publishes `version.json` last. Manual workflow runs
+upload only to a `manual-*` path and cannot replace the live release.
+
+The release workflow requires `GCP_SA_KEY`, `GCP_PROJECT`, and `GCS_BUCKET`.
+The service account needs object list/get/create/delete access on that bucket
+(for example, Storage Object Admin) because final promotion verifies versioned
+objects and copies them to the `latest/` compatibility paths.
 
 ## Distribution flow
 
 ```mermaid
 flowchart LR
-    tag["git tag / push"] --> check["Version consistency check"]
+    tag["git tag / push"] --> tests["Full test suite"]
+    tests --> check["Version consistency check"]
     check --> ci["CI (GitHub Actions)"]
     ci --> mac["macOS .dmg"]
     ci --> win["Windows setup.exe"]
     ci --> lin["Linux AppImage"]
-    mac --> gcs["Public GCS bucket"]
-    win --> gcs
-    lin --> gcs
-    gcs --> page["Download page (index.html)"]
+    mac --> versioned["Versioned GCS paths"]
+    win --> versioned
+    lin --> versioned
+    versioned --> promote["Verify and promote"]
+    promote --> page["Download page (index.html)"]
     page --> user["Labmate downloads & runs"]
 ```

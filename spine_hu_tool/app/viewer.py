@@ -436,8 +436,8 @@ class MainWindow(QtWidgets.QMainWindow):
         side.addWidget(self.hu_label)
 
         acc = QtWidgets.QHBoxLayout()
-        self.accept_btn = QtWidgets.QPushButton("Accept"); self.accept_btn.clicked.connect(lambda: self._decide(True))
-        self.reject_btn = QtWidgets.QPushButton("Reject"); self.reject_btn.clicked.connect(lambda: self._decide(False))
+        self.accept_btn = QtWidgets.QPushButton("Include result"); self.accept_btn.clicked.connect(lambda: self._decide(True))
+        self.reject_btn = QtWidgets.QPushButton("Exclude result"); self.reject_btn.clicked.connect(lambda: self._decide(False))
         acc.addWidget(self.accept_btn); acc.addWidget(self.reject_btn)
         side.addLayout(acc)
         self.finalize_btn = QtWidgets.QPushButton("Finalize (save review)")
@@ -615,9 +615,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.radius_val = QtWidgets.QLabel("-")
         rl.addWidget(self.radius_slider); rl.addWidget(self.radius_val)
         v.addLayout(rl)
-        recompute = QtWidgets.QPushButton("Recompute (reset to automatic)")
-        recompute.clicked.connect(self._recompute)
-        v.addWidget(recompute)
+        self.recompute_btn = QtWidgets.QPushButton("Recompute (reset to automatic)")
+        self.recompute_btn.clicked.connect(self._recompute)
+        v.addWidget(self.recompute_btn)
         v.addStretch()
         return box
 
@@ -1012,20 +1012,21 @@ class MainWindow(QtWidgets.QMainWindow):
             it = self.level_list.item(i)
             r = self.state.results[it.data(QtCore.Qt.UserRole)]
             st = r.qc.get("qc_status")
-            color = STATUS_COLOR.get(st, "#888888")
+            color = STATUS_COLOR.get(st, "#888888") if r.included else STATUS_COLOR["excluded"]
             mark = {"pass": "PASS", "review": "REVIEW", "fail": "FAIL",
                     "excluded": "EXCLUDED"}.get(st, "")
-            dec = {True: " [accepted]", False: " [rejected]"}.get(r.accepted, "")
-            if st == "excluded":
+            dec = (" [included]" if r.accepted is True else
+                   " [excluded]" if not r.included else "")
+            if not r.editable:
                 it.setText(f"{r.level:5s}  --  {mark}")
             else:
                 med = r.stats.get("median_HU", float("nan"))
                 it.setText(f"{r.level:5s}  {med:.0f} HU  {mark}{dec}")
             it.setForeground(QtGui.QColor(color))
 
-    def _is_excluded(self, level) -> bool:
+    def _is_editable(self, level) -> bool:
         r = self.state.results.get(level) if self.state else None
-        return bool(r is not None and r.qc.get("qc_status") == "excluded")
+        return bool(r is not None and r.editable)
 
     def _on_level_changed(self, row):
         if row < 0 or not self.state:
@@ -1035,11 +1036,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.radius_slider.blockSignals(True)
         self.radius_slider.setValue(int(round(r.radius_mm * 10)))
         self.radius_slider.blockSignals(False)
-        # excluded levels have no valid measurement: no accept/reject (or resize)
-        excluded = self._is_excluded(self.current_level)
-        self.accept_btn.setEnabled(not excluded)
-        self.reject_btn.setEnabled(not excluded)
-        self.radius_slider.setEnabled(not excluded)
+        editable = self._is_editable(self.current_level)
+        self.accept_btn.setEnabled(editable)
+        self.reject_btn.setEnabled(editable)
+        self.radius_slider.setEnabled(editable)
+        self.recompute_btn.setEnabled(editable)
         self.render()
 
     def _set_wl(self, c, w):
@@ -1071,10 +1072,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._after_edit()
 
     def _recompute(self):
-        if not self.current_level:
+        if not self.current_level or not self._is_editable(self.current_level):
             return None
         self.state.push_undo(self.current_level)
-        self.state.recompute_level(self.current_level)
+        result = self.state.recompute_level(self.current_level)
+        if result is None:
+            self._undo()
+            return None
         r = self.state.results[self.current_level]
         self.radius_slider.blockSignals(True)
         self.radius_slider.setValue(int(round(r.radius_mm * 10)))
@@ -1083,18 +1087,17 @@ class MainWindow(QtWidgets.QMainWindow):
         return r
 
     def _decide(self, accepted):
-        # excluded levels carry no measurement, so there's nothing to accept/reject
-        if self.current_level and not self._is_excluded(self.current_level):
+        if self.current_level and self._is_editable(self.current_level):
             self.state.push_undo(self.current_level)
             self.state.set_decision(self.current_level, accepted)
             self._refresh_level_list_colors()
 
     def _accept_advance(self):
-        """Enter: accept the current level (if measurable), then move to the next.
-        Excluded levels can't be accepted, so Enter just skips past them."""
+        """Enter: include the current level (if measurable), then advance.
+        Hard-excluded levels have no editable measurement and are skipped."""
         if not self.state or self.stack.currentIndex() != 1 or not self.current_level:
             return
-        if not self._is_excluded(self.current_level):
+        if self._is_editable(self.current_level):
             self._decide(True)
         row = self.level_list.currentRow()
         if 0 <= row < self.level_list.count() - 1:
@@ -1163,7 +1166,7 @@ class MainWindow(QtWidgets.QMainWindow):
         is no valid measurement). Gate-excluded levels that have no measurement
         crop get one built straight from the segmentation label.
         """
-        excluded = r.qc.get("qc_status") == "excluded"
+        excluded = not r.editable
         if r.crop_slices is not None and r.body_mask is not None:
             hu = self.state.volume.hu[r.crop_slices]
             roi = None if excluded else r.roi_mask
@@ -1251,7 +1254,7 @@ class MainWindow(QtWidgets.QMainWindow):
         warns = "<br>".join(f"&bull; {w}" for w in r.qc.get("warnings", [])) or "none"
         habitus = self._habitus_line(s)
         self.radius_val.setText(f"{r.radius_mm:.1f}")
-        if r.qc.get("qc_status") == "excluded":
+        if not r.editable or not s:
             self.hu_label.setText(
                 f"<b>{r.level}</b> ({MODE_LABELS.get(r.mode, r.mode)})<br>"
                 f"<b style='color:#c5544a'>EXCLUDED</b> - no HU reported<br>"
@@ -1262,6 +1265,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     if cal is not None else "")
         ctx = s.get("hu_context")
         ctx_line = f"<span style='color:#8a8a92'>{ctx}</span><br>" if ctx else ""
+        inclusion = ("INCLUDED" if r.included else "EXCLUDED FROM RESULTS")
+        reason = (f"reason: {r.exclusion_reason()}<br>"
+                  if not r.included else "")
         self.hu_label.setText(
             f"<b>{r.level}</b> ({MODE_LABELS.get(r.mode, r.mode)})<br>"
             f"median {s.get('median_HU', float('nan')):.0f} | mean {s.get('mean_HU', float('nan')):.0f} HU<br>"
@@ -1270,7 +1276,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"radius {r.radius_mm:.1f} mm | clearance {r.margin_mm:.1f} mm<br>"
             f"volume {s.get('volume_mm3', 0):.0f} mm&sup3;<br>"
             f"{habitus}"
-            f"<b>QC: {r.qc.get('qc_status')}</b><br>{ctx_line}{warns}")
+            f"<b>QC: {r.qc.get('qc_status')}</b> | <b>{inclusion}</b><br>"
+            f"{reason}{ctx_line}{warns}")
 
     def finalize(self):
         """Mark the run reviewed: save the physician's edits + write the export
@@ -1287,6 +1294,7 @@ class MainWindow(QtWidgets.QMainWindow):
             rec["overrides"] = run_store.overrides_from_state(self.state)
             rec["measurements"] = {lvl: r.summary()
                                    for lvl, r in self.state.results.items()}
+            rec["schema_version"] = run_store.RUN_SCHEMA_VERSION
             rec["status"] = "reviewed"
             export_dir = os.path.join(run_store.run_dir(self.current_run_id), "export")
             self._do_export(export_dir)

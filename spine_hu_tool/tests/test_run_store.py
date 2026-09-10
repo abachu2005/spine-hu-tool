@@ -4,6 +4,7 @@ Reopen is exercised with the DICOM load and segmentation STUBBED -- this never
 runs real local segmentation.
 """
 import os
+import json
 
 import numpy as np
 import pytest
@@ -28,6 +29,14 @@ def _phantom_state():
     return ReviewState.from_volume(vol, seg, levels=["L1"]), vol, seg
 
 
+def _failed_phantom_state():
+    full, _body, hu = make_vertebra_phantom()
+    hu[full] = 3000.0
+    seg = np.where(full, label_id_for("L1"), 0).astype(np.int16)
+    vol = Volume(hu=hu, spacing=(1.0, 1.0, 1.0))
+    return ReviewState.from_volume(vol, seg, levels=["L1"])
+
+
 def _meta(files):
     return {
         "patient_id": "P1", "patient_label": "P1", "study_uid": "stA",
@@ -45,7 +54,24 @@ def test_save_load_list_roundtrip(runs_dir):
     rs.save_run(rec)
     runs = rs.list_runs()
     assert len(runs) == 1 and runs[0]["id"] == rec["id"]
+    assert runs[0]["schema_version"] == rs.RUN_SCHEMA_VERSION
     assert rs.load_run(rec["id"])["study"]["series_uid"] == "1.2.3"
+
+
+def test_legacy_run_without_schema_version_loads_as_v1(runs_dir):
+    state, _v, _s = _phantom_state()
+    rec = rs.build_record(state, _meta(["/x/a.dcm"]), backend="cloud",
+                          resolution="full", mode="centroid_volume_sphere")
+    rec.pop("schema_version")
+    path = os.path.join(rs.runs_root(), rec["id"])
+    os.makedirs(path)
+    with open(os.path.join(path, "run.json"), "w") as f:
+        json.dump(rec, f)
+    assert rs.load_run(rec["id"])["schema_version"] == 1
+    migrated = rs.load_run(rec["id"])
+    migrated["schema_version"] = rs.RUN_SCHEMA_VERSION
+    rs.save_run(migrated)
+    assert rs.load_run(rec["id"])["schema_version"] == rs.RUN_SCHEMA_VERSION
 
 
 def test_overrides_roundtrip(runs_dir):
@@ -56,7 +82,8 @@ def test_overrides_roundtrip(runs_dir):
                           resolution="fast", mode="centroid_volume_sphere")
     rs.save_run(rec)
     ov = rs.load_run(rec["id"])["overrides"]["L1"]
-    assert ov["accepted"] is True and abs(ov["radius_mm"] - 6.5) < 1e-6
+    assert ov["accepted"] is True and ov["included"] is True
+    assert abs(ov["radius_mm"] - 6.5) < 1e-6
 
     # replay onto a fresh state
     full, _b, hu = make_vertebra_phantom()
@@ -65,6 +92,26 @@ def test_overrides_roundtrip(runs_dir):
     rs.apply_overrides(state2, {"L1": ov})
     assert state2.results["L1"].accepted is True
     assert abs(state2.results["L1"].radius_mm - 6.5) < 1e-6
+
+
+def test_failed_level_default_exclusion_roundtrips_and_legacy_defaults():
+    state = _failed_phantom_state()
+    assert state.results["L1"].accepted is None
+    ov = rs.overrides_from_state(state)["L1"]
+    assert ov["accepted"] is None and ov["included"] is False
+
+    fresh = _failed_phantom_state()
+    rs.apply_overrides(fresh, {"L1": ov})
+    assert not fresh.results["L1"].included
+
+    # Records from schema v1 have no explicit inclusion field. Recomputed QC
+    # still applies the new safe default without requiring a destructive migration.
+    legacy = _failed_phantom_state()
+    rs.apply_overrides(legacy, {"L1": {
+        "center_idx": list(legacy.results["L1"].center_idx),
+        "radius_mm": legacy.results["L1"].radius_mm,
+    }})
+    assert not legacy.results["L1"].included
 
 
 def test_batch_save_and_list(runs_dir):

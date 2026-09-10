@@ -21,24 +21,30 @@ def build_report(case: dict) -> dict:
     levels = {}
     for lvl, r in case["results"].items():
         s = r.stats
-        if r.qc.get("qc_status") == "excluded":
-            levels[lvl] = {"qc_status": "excluded",
-                           "reason": r.qc.get("exclusion_reason")}
+        if not r.included:
+            levels[lvl] = {
+                "qc_status": r.qc.get("qc_status"),
+                "included": False,
+                "reason": r.exclusion_reason(),
+            }
             continue
         entry = {
             "qc_status": r.qc.get("qc_status"),
+            "included": True,
+            "auto_excluded": bool(r.qc.get("auto_excluded")),
             "median_HU": s.get("median_HU"),
             "calibrated_median_HU": s.get("calibrated_median_HU"),
             "hu_context": s.get("hu_context"),
         }
+        if r.qc.get("auto_excluded"):
+            entry["screening_override_reason"] = r.qc.get("exclusion_reason")
         if r.comparison:
             entry["method_deltas_vs_primary"] = {
                 m: v.get("delta_median_vs_primary")
                 for m, v in r.comparison["methods"].items()}
         levels[lvl] = entry
 
-    measured = [v for v in levels.values() if v.get("qc_status") not in
-                ("excluded", None)]
+    measured = [v for v in levels.values() if v.get("included")]
     report = {
         "seg_status": case.get("seg_status"),
         "seg_global_reasons": (case.get("seg_check") or {}).get("global_reasons", []),
@@ -66,7 +72,7 @@ def print_report(report: dict) -> None:
     print(f"\n{'level':6s} {'medHU':>6s} {'calHU':>6s}  deltas(vs primary)   context")
     print("-" * 78)
     for lvl, e in report["levels"].items():
-        if e.get("qc_status") == "excluded":
+        if not e.get("included"):
             print(f"{lvl:6s} {'--':>6s} {'EXCLUDED':>6s}")
             continue
         deltas = e.get("method_deltas_vs_primary", {})

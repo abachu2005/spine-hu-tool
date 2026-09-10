@@ -24,6 +24,14 @@ def _state(audit_path=None):
                                    seg, levels=["L1"], audit_path=audit_path)
 
 
+def _failed_state():
+    full, _body, hu = make_vertebra_phantom()
+    hu[full] = 3000.0
+    seg = np.where(full, label_id_for("L1"), 0).astype(np.int16)
+    return ReviewState.from_volume(
+        Volume(hu=hu, spacing=(1.0, 1.0, 1.0)), seg, levels=["L1"])
+
+
 def _fake_studies(n):
     cands = []
     for i in range(n):
@@ -127,13 +135,17 @@ def test_enter_accepts_current_level():
     assert win.state.results["L1"].accepted is True
 
 
-def test_excluded_level_cannot_be_accepted_or_rejected():
-    # an excluded level has no measurement: accept/reject is disabled and a no-op,
+def test_unmeasurable_level_cannot_be_included_or_excluded():
+    # A hard-excluded level has no measurement: decisions are disabled and a no-op,
     # and Enter skips past it without marking a decision.
     from spine_hu_tool.app.viewer import MainWindow
     win = MainWindow()
     win.load_state(_state())
-    win.state.results["L1"].qc["qc_status"] = "excluded"   # simulate exclusion
+    r = win.state.results["L1"]
+    r.qc["qc_status"] = "excluded"
+    r.crop_slices = r.body_mask = r.roi_mask = None
+    r.stats = {}
+    r.accepted = None
     win._on_level_changed(0)
     assert not win.accept_btn.isEnabled()
     assert not win.reject_btn.isEnabled()
@@ -141,6 +153,28 @@ def test_excluded_level_cannot_be_accepted_or_rejected():
     assert win.state.results["L1"].accepted is None        # decision not applied
     win._accept_advance()
     assert win.state.results["L1"].accepted is None        # Enter did not accept
+
+
+def test_failed_level_is_visible_tunable_and_requires_explicit_include():
+    from spine_hu_tool.app.viewer import MainWindow
+    win = MainWindow()
+    win.load_state(_failed_state())
+    win.level_list.setCurrentRow(0)
+    r = win.state.results["L1"]
+    assert r.qc["qc_status"] == "fail" and not r.included
+    assert win.accept_btn.isEnabled()
+    assert win.reject_btn.isEnabled()
+    assert win.radius_slider.isEnabled()
+    assert win.recompute_btn.isEnabled()
+    assert "excluded" in win.level_list.item(0).text().lower()
+    assert "EXCLUDED FROM RESULTS" in win.hu_label.text()
+
+    win._on_radius(40)
+    assert abs(r.radius_mm - 4.0) < 1e-6
+    assert not r.included
+    win._decide(True)
+    assert r.included
+    assert "included" in win.level_list.item(0).text().lower()
 
 
 def test_scout_checkbox_follows_scout_availability(test_data_dir):
@@ -285,6 +319,7 @@ def test_open_run_and_finalize(tmp_path, monkeypatch):
             "study_date": "20240101", "source_folder": "/x", "files": ["/x/a.dcm"]}
     rec = rs.build_record(state, meta, backend="cloud", resolution="full",
                           mode="centroid_volume_sphere")
+    rec["schema_version"] = 1  # simulate reopening a pre-inclusion-policy run
     rs.save_run(rec)
 
     win = MainWindow()
@@ -303,6 +338,7 @@ def test_open_run_and_finalize(tmp_path, monkeypatch):
     win.finalize()
     updated = rs.load_run(rec["id"])
     assert updated["status"] == "reviewed"
+    assert updated["schema_version"] == rs.RUN_SCHEMA_VERSION
     assert updated["export_dir"] and os.path.isdir(updated["export_dir"])
 
 

@@ -63,6 +63,8 @@ def measure_scout(state: ReviewState, folder: str,
         r.stats.update({k: v for k, v in vals.items() if k != "scout_warnings"})
         if warns:
             r.qc.setdefault("warnings", []).extend(warns)
+            persistent = r.qc.setdefault("persistent_warnings", [])
+            persistent.extend(w for w in warns if w not in persistent)
     return block
 
 

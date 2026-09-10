@@ -30,6 +30,7 @@ import datetime as _dt
 from typing import Optional
 
 _STATUS = ("pending", "ready", "reviewed", "failed")
+RUN_SCHEMA_VERSION = 2
 
 
 class RunReopenError(RuntimeError):
@@ -100,6 +101,7 @@ def overrides_from_state(state) -> dict:
             continue
         out[lvl] = {
             "accepted": r.accepted,
+            "included": r.included,
             "center_idx": [int(c) for c in r.center_idx],
             "radius_mm": float(r.radius_mm),
         }
@@ -116,6 +118,7 @@ def build_record(state, study_meta: dict, *, backend: str, resolution: str,
                  status: str = "ready") -> dict:
     """Assemble a run record dict from a completed ReviewState."""
     return {
+        "schema_version": RUN_SCHEMA_VERSION,
         "id": run_id or new_run_id(),
         "batch_id": batch_id,
         "created": _now(),
@@ -137,6 +140,7 @@ def failed_record(study_meta: dict, error: str, *, backend: str, resolution: str
                   mode: str, run_id: Optional[str] = None,
                   batch_id: Optional[str] = None) -> dict:
     return {
+        "schema_version": RUN_SCHEMA_VERSION,
         "id": run_id or new_run_id(),
         "batch_id": batch_id,
         "created": _now(),
@@ -172,7 +176,9 @@ def save_run(record: dict) -> str:
 def load_run(run_id: str) -> dict:
     path = os.path.join(runs_root(), run_id, "run.json")
     with open(path) as f:
-        return json.load(f)
+        record = json.load(f)
+    record.setdefault("schema_version", 1)
+    return record
 
 
 def run_dir(run_id: str) -> str:
@@ -187,7 +193,9 @@ def list_runs() -> list:
         if os.path.exists(p):
             try:
                 with open(p) as f:
-                    out.append(json.load(f))
+                    record = json.load(f)
+                record.setdefault("schema_version", 1)
+                out.append(record)
             except (OSError, json.JSONDecodeError):
                 continue
     out.sort(key=lambda r: r.get("created", ""), reverse=True)

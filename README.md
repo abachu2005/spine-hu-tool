@@ -19,8 +19,8 @@ Units (HU)** in vertebral bodies from CT — an opportunistic bone-density signa
 1. **Ingest** a DICOM folder and auto-select the real axial CT series (rejecting
    scouts, reformats, and secondary captures — data quality only).
 2. **Segment** each vertebra (TotalSegmentator) and **tag levels** for metal
-   hardware / streak artifact, auto-excluding instrumented levels and their
-   immediate neighbors.
+   hardware / streak artifact, default-excluding instrumented levels and
+   flagging their immediate neighbors for review.
 3. **Isolate the vertebral body** from the posterior elements (morphological).
 4. Build a **per-vertebra local frame** (LR/AP/SI) so placement is tilt-aware.
 5. Place a **centroid-anchored sphere** in the central trabecular bone, sized to
@@ -29,7 +29,7 @@ Units (HU)** in vertebral bodies from CT — an opportunistic bone-density signa
    clipping, partial vertebra, cortical-tail hint) → pass / review / fail.
 7. Optionally measure **body habitus** — left-right width and anterior-posterior
    depth per level — from the **scout films**, corrected for beam divergence.
-8. **Review** in a greyscale, PACS-style desktop app (accept / reject / adjust).
+8. **Review** in a greyscale, PACS-style desktop app (include / exclude / adjust).
 9. **Export** CSV/JSON, tri-planar overlays, masks (NIfTI), a full
    reproducibility record, and an audit trail.
 
@@ -106,8 +106,10 @@ spine-hu-gui            # or: python -m spine_hu_tool.app.viewer
 
 Open a DICOM folder → the axial CT is auto-selected → **Analyze** → review levels
 in the tri-planar greyscale viewer (green = pass, amber = review, red =
-excluded/metal). Toggle body/inner/ROI overlays, change window/level, adjust the
-ROI radius, click to move the center, **Accept/Reject**, then **Export**.
+failed or excluded). Failed and automatically excluded levels remain visible and
+tunable, but stay out of reported results until explicitly included. Toggle
+body/inner/ROI overlays, change window/level, adjust the ROI radius, click to
+move the center, **Include result/Exclude result**, then **Export**.
 
 ### Command line
 
@@ -184,8 +186,9 @@ tests use the cached test data when present and skip otherwise.
   standalone diagnostic device.
 - Trabecular HU depends on scanner, kernel, kVp, and contrast — compare only
   within consistent protocols; report STANDARD-kernel non-contrast values.
-- Levels with hardware (or within the streak buffer) are excluded and must not
-  be reported; partial/edge vertebrae are flagged for review.
+- Levels that fail QC or contain hardware default to excluded from reporting but
+  retain an editable ROI for physician review; only an explicit reviewer action
+  can include them. Partial/edge vertebrae are flagged for review.
 - Scout body habitus reproduces to ~1 % across the two independent studies of the
   one patient whose export retained localizers; it has not yet been checked
   across patients, because the later de-identified re-exports dropped theirs.

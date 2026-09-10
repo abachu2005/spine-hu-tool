@@ -60,8 +60,42 @@ class ROIResult:
     crop_slices: Optional[tuple] = None
     body_mask: Optional[np.ndarray] = None
     inner_mask: Optional[np.ndarray] = None
-    accepted: Optional[bool] = None        # physician decision (None = unreviewed)
+    accepted: Optional[bool] = None        # reviewer inclusion decision (None = default policy)
     comparison: Optional[dict] = None      # per-ROI-method HU (reproducibility study)
+
+    @property
+    def editable(self) -> bool:
+        """Whether this result has usable geometry for physician adjustment."""
+        return (
+            self.crop_slices is not None
+            and self.body_mask is not None
+            and self.roi_mask is not None
+            and bool(np.any(self.body_mask))
+            and bool(np.any(self.roi_mask))
+        )
+
+    @property
+    def included(self) -> bool:
+        """Effective reporting policy, kept separate from scientific QC status."""
+        if self.qc.get("qc_status") == "excluded" or not self.editable:
+            return False
+        if self.accepted is not None:
+            return bool(self.accepted)
+        if self.qc.get("auto_excluded"):
+            return False
+        return self.qc.get("qc_status") != "fail"
+
+    def exclusion_reason(self) -> Optional[str]:
+        if self.included:
+            return None
+        reason = self.qc.get("exclusion_reason")
+        if reason:
+            return str(reason)
+        if self.accepted is False and not self.qc.get("auto_excluded"):
+            return "manually excluded by reviewer"
+        if self.qc.get("qc_status") == "fail":
+            return "failed quality control"
+        return "no reportable measurement"
 
     def summary(self) -> dict:
         d = {
@@ -77,5 +111,16 @@ class ROIResult:
         d.update({k: (round(v, 2) if isinstance(v, float) else v)
                   for k, v in self.stats.items()})
         d.update(self.qc)
-        d["accepted"] = self.accepted        # physician decision (None = unreviewed)
+        d["accepted"] = self.accepted
+        d["included"] = self.included
+        if not self.included:
+            d["exclusion_reason"] = self.exclusion_reason()
+        return d
+
+    def report_summary(self) -> dict:
+        """Final-results row; excluded levels stay auditable but report no HU."""
+        d = self.summary()
+        if not self.included:
+            for key in self.stats:
+                d.pop(key, None)
         return d

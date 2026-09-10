@@ -64,6 +64,11 @@ def _print_summary(case):
             d = s.get("body_depth_ap_mm")
             hab = (f" {w:6.1f}" if w is not None else f" {'-':>6s}") + \
                   (f" {d:6.1f}" if d is not None else f" {'-':>6s}")
+        if not r.included:
+            print(f"{lvl:6s} {'--':>6s} {'--':>6s} {r.radius_mm:6.1f}"
+                  f"{hab} {r.qc.get('qc_status'):>9s}  "
+                  f"EXCLUDED: {r.exclusion_reason()}")
+            continue
         print(f"{lvl:6s} {s.get('median_HU', float('nan')) or float('nan'):6.1f} "
               f"{s.get('calibrated_median_HU', float('nan')) or float('nan'):6.1f} "
               f"{r.radius_mm:6.1f}{hab} {r.qc.get('qc_status'):>9s}  "

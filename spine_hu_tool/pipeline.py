@@ -31,7 +31,7 @@ def _excluded_result(level: str, mode: str, reasons: list[str],
         full_vox=int(full_vox), body_vox=0, stats={},
         qc={"qc_status": "excluded", "exclusion_reason": "; ".join(reasons),
             "warnings": list(reasons), "near_metal": False,
-            "retained_fraction": 0.0},
+            "retained_fraction": 0.0, "auto_excluded": True},
         crop_slices=None, body_mask=None, inner_mask=None,
     )
 
@@ -102,26 +102,35 @@ def measure_level(volume: Volume, seg: np.ndarray, level: str,
                                  params.margin_floor_mm, params.margin_frac)
     inner, _dist = make_inner(body, spacing, margin)
 
-    if reasons:
-        warns = body_flags.get("warnings", []) + reasons
-        qc = {"qc_status": "excluded", "exclusion_reason": "; ".join(reasons),
-              "warnings": warns, "near_metal": False, "retained_fraction": 0.0}
-        return ROIResult(
-            level=level, mode=info["mode"], roi_mask=info["roi_mask"],
-            center_idx=info["center_idx"], radius_mm=info["radius_mm"],
-            max_safe_radius_mm=info["max_safe_radius_mm"], margin_mm=info["margin_mm"],
-            full_vox=int(full.sum()), body_vox=int(body.sum()),
-            stats={}, qc=qc, crop_slices=sl, body_mask=body, inner_mask=inner,
-        )
-
     qc = compute_qc(H, body, info, spacing, stats, params)
-    qc["warnings"] = body_flags.get("warnings", []) + qc["warnings"]
+    persistent_warnings = list(body_flags.get("warnings", []))
+    qc["warnings"] = persistent_warnings + qc["warnings"]
+    if reasons:
+        # Keep the ROI and raw measurement available for physician correction.
+        # Reporting inclusion is a separate decision; these concerns default it
+        # to excluded without turning the result into an uneditable placeholder.
+        qc["qc_status"] = "fail"
+        qc["auto_excluded"] = True
+        qc["exclusion_reason"] = "; ".join(reasons)
+        for reason in reasons:
+            if reason not in qc["warnings"]:
+                qc["warnings"].append(reason)
+            if reason not in persistent_warnings:
+                persistent_warnings.append(reason)
     if body_flags.get("partial"):
         qc["truncated"] = True
-        qc["warnings"].append(
+        partial_warning = (
             "review: vertebra clipped by scan field of view; verify ROI placement")
+        qc["warnings"].append(partial_warning)
+        persistent_warnings.append(partial_warning)
         if qc["qc_status"] == "pass":
             qc["qc_status"] = "review"
+    if qc["qc_status"] == "fail":
+        qc.setdefault("auto_excluded", True)
+        qc.setdefault("exclusion_reason", "; ".join(qc.get("warnings", []))
+                      or "failed quality control")
+    if persistent_warnings:
+        qc["persistent_warnings"] = persistent_warnings
 
     res = ROIResult(
         level=level, mode=info["mode"], roi_mask=info["roi_mask"],
@@ -159,10 +168,7 @@ def process_case(volume: Volume, seg: np.ndarray,
     tag_by_level = {t["level"]: t for t in tags}
 
     # When no explicit level list is given we ALWAYS walk every vertebra present
-    # in the scan so the review list is complete. Instrumented (metal) levels are
-    # shown as excluded entries rather than silently dropped -- otherwise a level
-    # with a screw simply vanishes from the app, which is confusing and hides the
-    # hardware from the physician.
+    # in the scan so the review list is complete.
     explicit_levels = levels is not None
     if not explicit_levels:
         levels = [lvl for _id, lvl in vertebra_labels(seg)]
@@ -175,26 +181,53 @@ def process_case(volume: Volume, seg: np.ndarray,
             progress(f"Measuring {lvl} ({i + 1}/{n})...", (i + 1) / n)
         status = tag_by_level.get(lvl, {}).get("status")
         sv = seg_levels.get(lvl)
+        default_exclusion_reasons = []
         if sv is not None and not sv["valid"]:
-            res = _excluded_result(
-                lvl, mode, ["segmentation invalid: " + r for r in sv["reasons"]],
-                full_vox=sv.get("voxels", 0))
-        elif (not explicit_levels) and status == "excluded":
-            # metal hardware inside the vertebra: never measure HU through metal,
-            # but keep the level visible (red / excluded) so the screws show up.
-            res = _excluded_result(
-                lvl, mode, ["instrumented level: metal hardware in vertebra"],
-                full_vox=tag_by_level.get(lvl, {}).get("voxels", 0))
-        else:
+            default_exclusion_reasons.extend(
+                "segmentation invalid: " + r for r in sv["reasons"])
+        if status == "excluded":
+            default_exclusion_reasons.append(
+                "instrumented level: metal hardware in vertebra")
+
+        measurement_error = None
+        try:
             res = measure_level(volume, seg, lvl, params, mode,
                                 compute_comparison=compute_comparison)
+        except Exception as exc:
+            if not default_exclusion_reasons:
+                raise
+            res = None
+            measurement_error = str(exc)
+        if res is None:
+            reasons = default_exclusion_reasons or [
+                "level could not produce an editable ROI measurement"]
+            if measurement_error:
+                reasons = reasons + [f"measurement unavailable: {measurement_error}"]
+            res = _excluded_result(
+                lvl, mode, reasons,
+                full_vox=(sv or {}).get(
+                    "voxels", tag_by_level.get(lvl, {}).get("voxels", 0)))
+        else:
+            if default_exclusion_reasons:
+                res.qc["auto_excluded"] = True
+                prior = res.qc.get("exclusion_reason")
+                all_reasons = ([prior] if prior else []) + default_exclusion_reasons
+                res.qc["exclusion_reason"] = "; ".join(all_reasons)
+                warns = res.qc.setdefault("warnings", [])
+                persistent = res.qc.setdefault("persistent_warnings", [])
+                for reason in default_exclusion_reasons:
+                    if reason not in warns:
+                        warns.append(reason)
+                    if reason not in persistent:
+                        persistent.append(reason)
             # near / adjacent to instrumented hardware: streak/bloom can bias the
             # number, so surface it but flag for review instead of passing clean.
             if (res is not None and only_clean and status == "review"
                     and res.qc.get("qc_status") in ("pass", None)):
                 res.qc["qc_status"] = "review"
-                res.qc.setdefault("warnings", []).append(
-                    "review: near an instrumented level (streak/bloom risk)")
+                warning = "review: near an instrumented level (streak/bloom risk)"
+                res.qc.setdefault("warnings", []).append(warning)
+                res.qc.setdefault("persistent_warnings", []).append(warning)
         if res is not None:
             res.qc.setdefault("level_status", status)
             results[lvl] = res

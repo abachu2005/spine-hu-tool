@@ -4,8 +4,8 @@ These lock in how the pipeline handles two real-world situations the new data
 exposed:
 
 * instrumented (Anon2): a lumbar scan with spinal *hardware*. The instrumented
-  levels and their neighbors must be quarantined, never measured through metal,
-  and the clean interior levels must still yield physiologic HU.
+  levels must default to excluded while retaining an editable measurement, and
+  the clean interior levels must still yield physiologic HU.
 * longspine (Anon1): a long C7->sacrum scan whose end levels are clipped by the
   field of view. Interior levels must measure with a sane cranio-caudal HU
   gradient while FOV-clipped ends are excluded, not passed.
@@ -49,15 +49,18 @@ def longspine_case():
 
 def _measured(case):
     return {l: r for l, r in case["results"].items()
-            if r.qc["qc_status"] in ("pass", "review") and r.stats}
+            if r.included and r.stats}
 
 
 def test_instrumented_levels_are_quarantined(instrumented_case):
     res = instrumented_case["results"]
-    # hardware levels are excluded and carry NO HU (never measured through metal)
+    # Hardware levels retain a tunable ROI but are excluded from reporting until
+    # a reviewer explicitly includes them.
     for lvl in ("L3", "L5", "S1"):
-        assert res[lvl].qc["qc_status"] == "excluded"
-        assert "median_HU" not in res[lvl].stats
+        assert not res[lvl].included
+        assert res[lvl].accepted is None
+        assert res[lvl].editable
+        assert "median_HU" in res[lvl].stats
     assert any("metal" in w or "instrumented" in w
                for w in res["L3"].qc.get("warnings", []))
     # a neighbor of an instrumented level is downgraded to review (streak/bloom)
@@ -90,8 +93,11 @@ def test_longspine_gradient_and_clipped_ends(longspine_case):
         assert measured["T5"].stats["median_HU"] > measured["T12"].stats["median_HU"]
     for r in measured.values():
         assert 0 < r.stats["median_HU"] < 400
-    # the ballooned/overlapping sacrum at the inferior FOV edge is not passed
-    assert res["sacrum"].qc["qc_status"] in ("excluded", "review", "fail")
+    # The ballooned/overlapping sacrum can retain a technically measurable ROI,
+    # but segmentation screening keeps it out of reported results by default.
+    assert not res["sacrum"].included
+    assert res["sacrum"].qc.get("auto_excluded") or \
+        res["sacrum"].qc["qc_status"] in ("excluded", "review", "fail")
 
 
 def test_no_measured_level_reports_a_diagnosis(longspine_case):

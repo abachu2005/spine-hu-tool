@@ -84,7 +84,7 @@
           <h2>macOS</h2>
           <p>Apple Silicon / Intel - open the .dmg, drag to Applications.</p>
         </div>
-        <a class="dl" href="latest/SpineHUTool-macos.dmg">Download .dmg</a>
+        <a class="dl" id="download-macos" href="latest/SpineHUTool-macos.dmg">Download .dmg</a>
       </div>
       <details>
         <summary>App won't open ("unidentified developer")?</summary>
@@ -101,7 +101,7 @@
           <h2>Windows</h2>
           <p>64-bit - run the setup wizard (Start Menu shortcut + uninstaller).</p>
         </div>
-        <a class="dl" href="latest/SpineHUTool-windows-setup.exe">Download setup .exe</a>
+        <a class="dl" id="download-windows" href="latest/SpineHUTool-windows-setup.exe">Download setup .exe</a>
       </div>
       <details>
         <summary>SmartScreen warning?</summary>
@@ -115,7 +115,7 @@
           <h2>Linux</h2>
           <p>x86_64 AppImage - no install needed.</p>
         </div>
-        <a class="dl" href="latest/SpineHUTool-linux-x86_64.AppImage">Download AppImage</a>
+        <a class="dl" id="download-linux" href="latest/SpineHUTool-linux-x86_64.AppImage">Download AppImage</a>
       </div>
       <details>
         <summary>How to run an AppImage</summary>
@@ -151,6 +151,14 @@
       .then(function (d) {
         if (d && d.version) {
           document.getElementById('ver').textContent = 'v' + d.version;
+        }
+        if (d && d.files) {
+          ['macos', 'windows', 'linux'].forEach(function (os) {
+            var link = document.getElementById('download-' + os);
+            if (link && d.files[os]) {
+              link.href = d.files[os];
+            }
+          });
         }
       })
       .catch(function () {});

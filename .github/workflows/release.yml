@@ -12,8 +12,27 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    name: Test release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[test]"
+      - name: Run full test suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -q
+
   build:
     name: Build (${{ matrix.os }})
+    needs: test
     runs-on: ${{ matrix.os }}
     # Surface the gating secrets as env so step `if:` conditions can check them.
     # Empty when the secret is unset -> the optional signing steps are skipped.
@@ -52,6 +71,10 @@ jobs:
           # On a tag build the tag is the release identity, so require the code
           # to agree with it as well as with the packaging files.
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "release tags must use vMAJOR.MINOR.PATCH" >&2
+              exit 1
+            }
             python packaging/sync_version.py --check --expect "${GITHUB_REF_NAME#v}"
           else
             python packaging/sync_version.py --check
@@ -210,11 +233,12 @@ jobs:
           fi
           python packaging/verify_build.py --app "$APP"
 
-      # Publish this OS's installer straight to GCS. The offline installers are
+      # Upload this OS's installer straight to its immutable GCS release path.
+      # The offline installers are
       # multi-GB -- far too large for GitHub's artifact storage (it hits the
       # account quota) or a GitHub Release (2 GB/file limit) -- so each build job
-      # uploads its own file directly to the public bucket the download page
-      # serves. Skipped when GCP creds aren't configured (e.g. a fork).
+      # uploads its own file. A final job promotes latest and the download page
+      # only after all three native builds have succeeded.
       - name: Authenticate to Google Cloud
         if: ${{ env.GCP_SA_KEY != '' }}
         uses: google-github-actions/auth@v2
@@ -235,7 +259,7 @@ jobs:
         run: |
           set -euo pipefail
           B="gs://$GCS_BUCKET"
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "${GITHUB_REF}" == refs/tags/* ]]; then
             VER="${GITHUB_REF_NAME}"
           else
             VER="manual-${GITHUB_RUN_NUMBER}"
@@ -243,38 +267,102 @@ jobs:
           shopt -s nullglob
           for f in artifacts/*; do
             name="$(basename "$f")"
-            echo "Uploading $name -> $B/{latest,$VER}/"
-            gcloud storage cp "$f" "$B/latest/$name" --cache-control="public, max-age=3600"
-            gcloud storage cp "$f" "$B/$VER/$name"   --cache-control="public, max-age=3600"
+            echo "Uploading $name -> $B/$VER/"
+            gcloud storage cp "$f" "$B/$VER/$name" \
+              --cache-control="public, max-age=3600" --if-generation-match=0
           done
 
-      # The download page itself (small text/image files) is published once, from
-      # the Linux job, so a viewer always sees the current version + links.
-      - name: Publish download page (Linux)
-        if: ${{ runner.os == 'Linux' && env.GCP_SA_KEY != '' }}
+  publish:
+    name: Publish installers and download page
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    concurrency:
+      group: spine-hu-live-publish
+      cancel-in-progress: false
+    env:
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+      GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require publishing credentials
         shell: bash
-        env:
-          GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
+        run: |
+          set -euo pipefail
+          test -n "$GCP_SA_KEY"
+          test -n "$GCS_BUCKET"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT }}
+
+      - name: Verify and promote release
+        shell: bash
         run: |
           set -euo pipefail
           B="gs://$GCS_BUCKET"
-          gcloud storage cp packaging/download/index.html  "$B/index.html"  --cache-control="no-cache"
-          gcloud storage cp packaging/download/version.json "$B/version.json" --cache-control="no-cache"
-          gcloud storage cp packaging/icons/spine_hu.png    "$B/icon.png"    --cache-control="public, max-age=86400" || true
+          VER="$GITHUB_REF_NAME"
+          CURRENT="$(
+            gcloud storage cat "$B/version.json" 2>/dev/null |
+              python -c 'import json,sys; print(json.load(sys.stdin).get("version", ""))'
+          )" || CURRENT=""
+          set +e
+          python - "$CURRENT" "${VER#v}" <<'PY'
+          import sys
+
+          def version_tuple(value):
+              return tuple(int(part) for part in value.split("."))
+
+          current, candidate = sys.argv[1:3]
+          if current and version_tuple(current) > version_tuple(candidate):
+              print(f"newer live v{current} exists; skipping stale v{candidate}")
+              raise SystemExit(3)
+          PY
+          version_status=$?
+          set -e
+          if [[ "$version_status" -eq 3 ]]; then
+            exit 0
+          fi
+          test "$version_status" -eq 0
+          artifacts=(
+            SpineHUTool-macos.dmg
+            SpineHUTool-windows-setup.exe
+            SpineHUTool-linux-x86_64.AppImage
+          )
+          for name in "${artifacts[@]}"; do
+            gcloud storage ls "$B/$VER/$name"
+          done
+          for name in "${artifacts[@]}"; do
+            gcloud storage cp "$B/$VER/$name" "$B/latest/$name" \
+              --cache-control="public, max-age=3600"
+          done
+          gcloud storage cp packaging/download/index.html "$B/index.html" \
+            --cache-control="no-cache"
+          gcloud storage cp packaging/icons/spine_hu.png "$B/icon.png" \
+            --cache-control="public, max-age=86400"
+          # Metadata is the release pointer and is intentionally published last.
+          gcloud storage cp packaging/download/version.json "$B/version.json" \
+            --cache-control="no-cache"
           echo "Published. Download page: https://storage.googleapis.com/$GCS_BUCKET/index.html"
 
   # Lightweight GitHub Release for the changelog/tag record only. The installers
   # live on GCS (too large for release assets), so no files are attached here.
   release:
     name: Publish GitHub Release (notes only)
-    needs: build
+    needs: publish
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
     steps:
       - name: Publish release notes
-        continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
@@ -283,7 +371,7 @@ jobs:
 
             Download the installer for your OS from the download page
             (installers are hosted there, not attached here):
-            https://storage.googleapis.com/spine-hu-tool-downloads/index.html
+            https://storage.googleapis.com/${{ secrets.GCS_BUCKET }}/index.html
 
             - **macOS**: `SpineHUTool-macos.dmg` (open, drag to Applications)
             - **Windows**: `SpineHUTool-windows-setup.exe` (setup wizard)

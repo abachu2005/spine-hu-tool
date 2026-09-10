@@ -14,7 +14,7 @@ def _now() -> str:
 
 
 def write_results_csv(results: dict, path: str) -> str:
-    rows = [r.summary() for r in results.values()]
+    rows = [r.report_summary() for r in results.values()]
     if not rows:
         open(path, "w").close()
         return path
@@ -30,7 +30,9 @@ def write_results_csv(results: dict, path: str) -> str:
 def write_results_json(case: dict, path: str) -> str:
     from ..scout.thickness import scout_json
     payload = {
-        "results": {lvl: r.summary() for lvl, r in case["results"].items()},
+        "schema_version": 2,
+        "tool_version": __version__,
+        "results": {lvl: r.report_summary() for lvl, r in case["results"].items()},
         "level_tags": case.get("level_tags", []),
         "mode": case.get("mode"),
         "params": case.get("params"),
@@ -47,7 +49,7 @@ def write_results_json(case: dict, path: str) -> str:
 def write_comparison(results: dict, json_path: str, csv_path: str):
     """Per-level ROI-method comparison for the reproducibility study."""
     payload = {lvl: r.comparison for lvl, r in results.items()
-               if getattr(r, "comparison", None)}
+               if r.included and getattr(r, "comparison", None)}
     if not payload:
         return None
     with open(json_path, "w") as f:
@@ -81,6 +83,8 @@ def write_reproducibility(case: dict, volume_meta: dict, path: str) -> str:
     except Exception:
         torch_v = None
     record = {
+        "schema_version": 2,
+        "inclusion_policy": "qc-fail-default-excluded-explicit-include",
         "tool_version": __version__,
         "created": _now(),
         "software": {"torch": torch_v},
@@ -173,7 +177,7 @@ def export_case(case: dict, volume, out_dir: str,
         odir = os.path.join(out_dir, "overlays")
         os.makedirs(odir, exist_ok=True)
         for lvl, r in case["results"].items():
-            if r.crop_slices is None:
+            if r.crop_slices is None or r.roi_mask is None or r.body_mask is None:
                 continue
             hu_crop = volume.hu[r.crop_slices]
             render_roi_overlay(hu_crop, r, volume.spacing,
@@ -188,7 +192,7 @@ def export_case(case: dict, volume, out_dir: str,
         mdir = os.path.join(out_dir, "masks")
         os.makedirs(mdir, exist_ok=True)
         for lvl, r in case["results"].items():
-            if r.crop_slices is None:
+            if r.crop_slices is None or r.roi_mask is None or r.body_mask is None:
                 continue
             # place cropped ROI back into full-volume frame for portability
             full = np.zeros(volume.shape, dtype=np.uint8)

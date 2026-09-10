@@ -32,6 +32,11 @@ VERSION_JSON = os.path.join(ROOT, "packaging", "download", "version.json")
 
 _INIT_RE = re.compile(r'^__version__\s*=\s*["\']([^"\']+)["\']', re.M)
 _ISS_RE = re.compile(r'^(#define\s+AppVersion\s+")([^"]*)(")', re.M)
+_DOWNLOAD_ARTIFACTS = {
+    "macos": "SpineHUTool-macos.dmg",
+    "windows": "SpineHUTool-windows-setup.exe",
+    "linux": "SpineHUTool-linux-x86_64.AppImage",
+}
 
 
 def read_version(root: str = ROOT) -> str:
@@ -82,14 +87,22 @@ def _sync_version_json(version: str, write: bool) -> str | None:
     with open(VERSION_JSON, encoding="utf-8") as fh:
         data = json.load(fh)
     current = data.get("version")
-    if current == version:
+    expected_files = {
+        os_name: f"v{version}/{artifact}"
+        for os_name, artifact in _DOWNLOAD_ARTIFACTS.items()
+    }
+    if current == version and data.get("files") == expected_files:
         return None
     if write:
         data["version"] = version
+        data["files"] = expected_files
         with open(VERSION_JSON, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2)
             fh.write("\n")
-    return f"packaging/download/version.json: version {current!r}"
+    return (
+        "packaging/download/version.json: "
+        f"version {current!r}, files {data.get('files')!r}"
+    )
 
 
 def main(argv=None) -> int:

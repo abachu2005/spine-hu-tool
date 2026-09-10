@@ -117,6 +117,8 @@ def test_failure_hook_carries_user_facing_error(fake_requests, monkeypatch):
     ca.archive_analysis_failure(arch, err, backend="local",
                                 mode="m", fast=False, folder="/data/case1")
     m = submitted["manifest"]
+    assert m["schema_version"] == 2
+    assert m["inclusion_policy"] == "qc-fail-default-excluded-explicit-include"
     assert m["status"] == "failed"
     assert m["error"]["kind"] == "local-runtime-broken"
     # the archived manifest shows exactly what the user saw

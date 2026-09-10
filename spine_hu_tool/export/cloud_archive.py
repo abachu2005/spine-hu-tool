@@ -86,6 +86,8 @@ class RunArchiver:
         except Exception:
             user = "unknown"
         m = {
+            "schema_version": 2,
+            "inclusion_policy": "qc-fail-default-excluded-explicit-include",
             "run_id": self.run_id,
             "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "app_version": __version__,
