@@ -13,7 +13,7 @@ from .config import ROIParams
 from .geometry.coords import crop_bbox
 from .roi.body_isolation import isolate_body
 from .roi.modes import place_roi, COMPARISON_MODES
-from .roi.distance import make_inner, proportional_margin, body_distance
+from .roi.distance import proportional_margin, body_distance
 from .measurement.hu_stats import compute_hu_stats
 from .measurement.qc import compute_qc
 from .measurement.level_qc import tag_levels
@@ -97,10 +97,12 @@ def measure_level(volume: Volume, seg: np.ndarray, level: str,
     if stats.get("volume_mm3", 0.0) < config.MIN_ROI_VOLUME_MM3:
         reasons.append(f"ROI volume {stats.get('volume_mm3', 0.0):.0f}mm3 below minimum")
 
-    # inner compartment retained for visualization
-    margin = proportional_margin(float(body_distance(body, spacing).max()),
+    # inner compartment retained for visualization (one distance transform
+    # serves both the margin and the inner mask)
+    body_dist = body_distance(body, spacing)
+    margin = proportional_margin(float(body_dist.max()),
                                  params.margin_floor_mm, params.margin_frac)
-    inner, _dist = make_inner(body, spacing, margin)
+    inner = body_dist >= margin
 
     qc = compute_qc(H, body, info, spacing, stats, params)
     persistent_warnings = list(body_flags.get("warnings", []))

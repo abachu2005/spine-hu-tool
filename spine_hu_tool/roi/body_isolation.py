@@ -10,9 +10,9 @@ review rather than failing silently.
 """
 from __future__ import annotations
 import numpy as np
-from scipy.ndimage import binary_erosion, binary_dilation, binary_fill_holes, label
+from scipy.ndimage import binary_fill_holes, label, distance_transform_edt
 
-from ..geometry.coords import ball, largest_cc
+from ..geometry.coords import largest_cc
 
 
 def _most_anterior_component(mask: np.ndarray, min_vox: int = 50) -> np.ndarray:
@@ -59,14 +59,26 @@ def isolate_body(full_mask: np.ndarray, spacing, open_mm: float | None = None) -
     if open_mm is not None and open_mm not in candidates:
         candidates = sorted(set(candidates) | {float(open_mm)}, reverse=True)
 
+    # Morphology via distance transforms instead of structuring-element
+    # erosion/dilation: erosion by a radius-r ball keeps exactly the voxels
+    # whose distance to the nearest background voxel exceeds r, so ONE EDT
+    # serves every candidate radius. On fine-spacing scans (e.g. 0.3 mm
+    # in-plane) this is orders of magnitude faster than convolving a ~40-voxel
+    # -wide kernel per candidate, and produces identical masks (the array is
+    # zero-padded so the scan boundary counts as background, matching
+    # binary_erosion's border_value=0).
+    dist_in = distance_transform_edt(
+        np.pad(M, 1), sampling=spacing)[1:-1, 1:-1, 1:-1]
+
     results = []
     for om in candidates:
-        b = ball(om, spacing)
-        eroded = binary_erosion(M, b)
+        eroded = dist_in > om
         if not eroded.any():
             continue                       # this opening annihilates the mask
         core = _most_anterior_component(eroded)
-        body = binary_fill_holes(binary_dilation(core, b) & M)
+        # dilation of `core` by the same ball == voxels within om of core
+        dilated = distance_transform_edt(~core, sampling=spacing) <= om
+        body = binary_fill_holes(dilated & M)
         body = largest_cc(body)
         ratio = body.sum() / nvox
         results.append((om, ratio, body))
