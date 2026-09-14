@@ -338,8 +338,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.past_runs_btn = QtWidgets.QPushButton("View past runs...")
         self.past_runs_btn.setFixedWidth(260)
         self.past_runs_btn.clicked.connect(self.open_past_runs)
-        # Segmentation runs on Cloud Run by default (prefilled); the heavy ML
-        # step never touches this machine unless the field is explicitly cleared.
+        # The hosted endpoint remains available for deployments that provide
+        # credentials, while full release builds prefer their bundled local
+        # segmentation runtime by default.
         self.seg_url_edit = QtWidgets.QLineEdit(resolve_seg_url(None) or "")
         self.seg_url_edit.setFixedWidth(420)
         self.seg_url_edit.setPlaceholderText("Segmentation server URL (cloud default)")
@@ -370,7 +371,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setup_local_btn = QtWidgets.QPushButton("Set up local segmentation...")
         self.setup_local_btn.setFixedWidth(420)
         self.setup_local_btn.clicked.connect(self.setup_local_seg)
-        self._refresh_local_seg_state()
+        self._refresh_local_seg_state(prefer_local=True)
         # Body habitus from the scout films. Off unless the opened study actually
         # ships localizers, which many de-identified exports drop.
         self.scout_cb = QtWidgets.QCheckBox("Record scout film measurements")
@@ -732,11 +733,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # choice is unambiguous.
         self.seg_url_edit.setEnabled(not checked)
 
-    def _refresh_local_seg_state(self):
+    def _refresh_local_seg_state(self, prefer_local: bool = False):
         """Reflect whether local segmentation is installed: enable the checkbox
         if so, otherwise offer the one-time setup button."""
         avail = local_seg_available()
         self.local_seg_cb.setEnabled(avail)
+        if avail and prefer_local:
+            self.local_seg_cb.setChecked(True)
         if not avail and self.local_seg_cb.isChecked():
             self.local_seg_cb.setChecked(False)
         self.setup_local_btn.setVisible(not avail)

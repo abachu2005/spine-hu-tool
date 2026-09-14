@@ -47,11 +47,16 @@ def test_resolve_seg_url(monkeypatch):
 
 
 def test_resolve_seg_url_defaults_to_cloud(monkeypatch):
-    # Cloud is the default backend: with no override and no creds file, the
-    # baked-in deployed URL is used (never None -> never silently local).
+    # The endpoint is public configuration and may be baked into the client.
     monkeypatch.delenv("SPINE_HU_SEG_URL", raising=False)
     monkeypatch.setattr(backends, "_from_creds_file", lambda key: None)
     assert backends.resolve_seg_url(None) == backends.DEFAULT_SEG_URL
+
+
+def test_api_key_has_no_baked_in_default(monkeypatch):
+    monkeypatch.delenv("SPINE_HU_API_KEY", raising=False)
+    monkeypatch.setattr(backends, "_from_creds_file", lambda key: None)
+    assert backends.resolve_api_key(None) is None
 
 
 def test_segment_local_when_no_url(monkeypatch, tmp_path):
