@@ -1,8 +1,8 @@
 {
-  "version": "0.2.4",
+  "version": "0.2.5",
   "files": {
-    "macos": "v0.2.4/SpineHUTool-macos.dmg",
-    "windows": "v0.2.4/SpineHUTool-windows-setup.exe",
-    "linux": "v0.2.4/SpineHUTool-linux-x86_64.AppImage"
+    "macos": "v0.2.5/SpineHUTool-macos.dmg",
+    "windows": "v0.2.5/SpineHUTool-windows-setup.exe",
+    "linux": "v0.2.5/SpineHUTool-linux-x86_64.AppImage"
   }
 }

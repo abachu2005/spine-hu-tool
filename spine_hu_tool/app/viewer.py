@@ -401,6 +401,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setVisible(False)
         self.status_lbl = QtWidgets.QLabel(""); self.status_lbl.setAlignment(QtCore.Qt.AlignCenter)
         self.status_lbl.setWordWrap(True)
+        # Constrain wrapping to the progress-bar width.  Without an explicit
+        # width, QLabel's word-wrapped size hint can be too short on macOS and
+        # clip the final line of longer segmentation status messages.
+        self.status_lbl.setFixedWidth(420)
+        self.status_lbl.setMinimumHeight(42)
+        self.status_lbl.setSizePolicy(
+            QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Minimum)
         for widget in (title, sub, btn, self.past_runs_btn, self.seg_url_edit,
                        self.local_seg_cb, self.res_combo, self.setup_local_btn,
                        self.scout_cb, self.roi_mode_combo,
