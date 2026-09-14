@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Documented CI variable names are not credential values"
+regexTarget = "match"
+regexes = ['''MACOS_CERT_P12''']
